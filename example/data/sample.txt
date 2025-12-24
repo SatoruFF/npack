@@ -1,0 +1,2 @@
+This is sample data loaded from the virtual file system.
+The file was automatically detected and bundled by npack.

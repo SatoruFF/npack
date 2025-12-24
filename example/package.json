@@ -1,0 +1,7 @@
+{
+  "name": "test-app",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "index.js",
+  "description": "Test app for npack"
+}

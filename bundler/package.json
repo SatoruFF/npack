@@ -2,10 +2,10 @@
   "name": "npack-bundler",
   "version": "0.1.0",
   "type": "module",
+  "description": "Internal bundler for npack",
   "dependencies": {
-    "esbuild": "^0.24.0"
-  },
-  "devDependencies": {
-    "postject": "^1.0.0-alpha.6"
+    "esbuild": "^0.24.2",
+    "@babel/parser": "^7.26.3",
+    "@babel/traverse": "^7.26.5"
   }
 }

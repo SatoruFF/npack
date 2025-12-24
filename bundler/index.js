@@ -1,47 +1,72 @@
 import esbuild from "esbuild";
 import fs from "fs/promises";
 import path from "path";
-import { createHash } from "crypto";
+import { parse } from "@babel/parser";
+import traverse from "@babel/traverse";
 
 /**
- * Plugin for scanning and inline files that are uploaded via fs
+ * Анализирует код и находит все динамические пути
  */
-const virtualFileSystemPlugin = {
-  name: "vfs",
-  setup(build) {
-    const vfsFiles = new Map();
-
-    build.onLoad({ filter: /\.(js|ts|mjs|cjs)$/ }, async (args) => {
-      const source = await fs.readFile(args.path, "utf8");
-      
-      // find patters fs.readFileSync, fs.readFile with path.join
-      const patterns = [
-        /fs\.readFileSync\s*\(\s*path\.join\s*\([^)]+\)[^)]*\)/g,
-        /fs\.promises\.readFile\s*\(\s*path\.join\s*\([^)]+\)[^)]*\)/g,
-        /readFileSync\s*\(\s*path\.join\s*\([^)]+\)[^)]*\)/g,
-      ];
-
-      let modified = source;
-      const baseDir = path.dirname(args.path);
-
-    // Here you can add more complex AST analysis logic
-      // For now, just note that the file can use dynamic paths
-      
-      return {
-        contents: source,
-        loader: args.path.endsWith(".ts") ? "ts" : "js",
-      };
+async function analyzeDynamicPaths(filePath) {
+  const source = await fs.readFile(filePath, "utf8");
+  const dynamicPaths = new Set();
+  
+  try {
+    const ast = parse(source, {
+      sourceType: "unambiguous",
+      plugins: ["typescript", "jsx"],
     });
-  },
-};
+
+    traverse.default(ast, {
+      CallExpression(path) {
+        const callee = path.node.callee;
+        
+        // Ищем path.join(__dirname, ...)
+        if (
+          callee.type === "MemberExpression" &&
+          callee.object.name === "path" &&
+          callee.property.name === "join"
+        ) {
+          const args = path.node.arguments;
+          if (args.length >= 2 && args[0].name === "__dirname") {
+            if (args[1].type === "StringLiteral") {
+              dynamicPaths.add(args[1].value);
+            }
+          }
+        }
+        
+        // Ищем fs.readFileSync/readFile
+        if (
+          callee.type === "MemberExpression" &&
+          (callee.property.name === "readFileSync" || 
+           callee.property.name === "readFile")
+        ) {
+          // Пометить файл как использующий динамические пути
+          dynamicPaths.add("__dynamic__");
+        }
+      },
+    });
+  } catch (e) {
+    console.warn(`Cannot parse ${filePath}: ${e.message}`);
+  }
+
+  return dynamicPaths;
+}
 
 /**
- * Scans the directory and collects all the files for VFS
+ * Собирает все статические ассеты и динамически найденные файлы
  */
-async function collectStaticAssets(appDir) {
+async function collectAllAssets(appDir, scannedFiles = new Set()) {
   const assets = new Map();
-  const commonDirs = ["config", "templates", "public", "assets", "data"];
+  
+  // Стандартные директории со статикой
+  const commonDirs = [
+    "config", "templates", "public", "assets", "data", 
+    "migrations", "views", "locale", "locales", "i18n",
+    "static", "resources", "sql", "queries"
+  ];
 
+  // Сканируем стандартные директории
   for (const dir of commonDirs) {
     const fullPath = path.join(appDir, dir);
     try {
@@ -50,8 +75,30 @@ async function collectStaticAssets(appDir) {
         await scanDirectory(fullPath, appDir, assets);
       }
     } catch (e) {
-      // Cannot find directory( just skip
+      // Директория не найдена - пропускаем
     }
+  }
+
+  // Сканируем файлы с нестандартными расширениями в корне проекта
+  const nonCodeExtensions = [
+    ".sql", ".json", ".yaml", ".yml", ".xml", ".txt", 
+    ".md", ".csv", ".env", ".pem", ".key", ".cert"
+  ];
+  
+  try {
+    const entries = await fs.readdir(appDir, { withFileTypes: true });
+    for (const entry of entries) {
+      if (entry.isFile() && nonCodeExtensions.some(ext => entry.name.endsWith(ext))) {
+        const fullPath = path.join(appDir, entry.name);
+        const content = await fs.readFile(fullPath);
+        assets.set("/" + entry.name, {
+          content: content.toString("base64"),
+          encoding: "base64",
+        });
+      }
+    }
+  } catch (e) {
+    // Игнорируем ошибки
   }
 
   return assets;
@@ -63,15 +110,18 @@ async function scanDirectory(dir, baseDir, assets) {
   for (const entry of entries) {
     const fullPath = path.join(dir, entry.name);
     
+    if (entry.name === "node_modules" || entry.name === ".git") {
+      continue;
+    }
+    
     if (entry.isDirectory()) {
       await scanDirectory(fullPath, baseDir, assets);
     } else {
       const relativePath = path.relative(baseDir, fullPath);
       const content = await fs.readFile(fullPath);
-      const base64 = content.toString("base64");
       
       assets.set("/" + relativePath.replace(/\\/g, "/"), {
-        content: base64,
+        content: content.toString("base64"),
         encoding: "base64",
       });
     }
@@ -87,12 +137,10 @@ async function findEntryPoint(appDir) {
   try {
     const packageJson = JSON.parse(await fs.readFile(packageJsonPath, "utf8"));
     
-    // Priority: bin > main > index.js
     if (packageJson.bin) {
       if (typeof packageJson.bin === "string") {
         return path.join(appDir, packageJson.bin);
       } else {
-        // Берем первый bin
         const firstBin = Object.values(packageJson.bin)[0];
         return path.join(appDir, firstBin);
       }
@@ -102,11 +150,12 @@ async function findEntryPoint(appDir) {
       return path.join(appDir, packageJson.main);
     }
     
-    // Fallback на index.js
     return path.join(appDir, "index.js");
   } catch (e) {
-    // if cannot find package.json, check standalone files
-    const candidates = ["index.js", "index.mjs", "index.ts", "src/index.js", "src/index.ts"];
+    const candidates = [
+      "index.js", "index.mjs", "index.ts", 
+      "src/index.js", "src/index.ts", "src/main.js"
+    ];
     
     for (const candidate of candidates) {
       const fullPath = path.join(appDir, candidate);
@@ -123,58 +172,175 @@ async function findEntryPoint(appDir) {
 }
 
 /**
- * Generate VFS code
+ * Генерирует VFS код с полным перехватом путей
  */
-function generateVFSCode(assets) {
-  const entries = Array.from(assets.entries()).map(([path, data]) => {
-    return `  ${JSON.stringify(path)}: {
+function generateVFSCode(assets, appDir) {
+  const entries = Array.from(assets.entries()).map(([filePath, data]) => {
+    return `  ${JSON.stringify(filePath)}: {
     content: ${JSON.stringify(data.content)},
     encoding: ${JSON.stringify(data.encoding)}
   }`;
   });
 
   return `
-// Virtual File System
+// ========== VIRTUAL FILE SYSTEM ==========
 const __vfs = {
 ${entries.join(",\n")}
 };
 
+// Оригинальные функции
 import { Buffer } from "buffer";
-const originalReadFileSync = fs.readFileSync;
-const originalReadFile = fs.promises.readFile;
+import * as originalFs from "fs";
+const originalReadFileSync = originalFs.readFileSync;
+const originalReadFile = originalFs.promises.readFile;
+const originalExistsSync = originalFs.existsSync;
+const originalStatSync = originalFs.statSync;
+const originalReaddirSync = originalFs.readdirSync;
 
-fs.readFileSync = function(filePath, options) {
-  const normalized = filePath.toString().replace(/\\\\/g, "/");
+// Нормализация путей
+function normalizePath(filePath) {
+  if (!filePath) return filePath;
+  
+  let normalized = filePath.toString().replace(/\\\\/g, "/");
+  
+  // Убираем префикс file://
+  if (normalized.startsWith("file://")) {
+    normalized = normalized.slice(7);
+  }
+  
+  // Если путь относительный, делаем его абсолютным относительно __dirname
+  if (!normalized.startsWith("/")) {
+    normalized = "/" + normalized;
+  }
+  
+  return normalized;
+}
+
+// Проверка наличия файла в VFS
+function isInVFS(filePath) {
+  const normalized = normalizePath(filePath);
+  if (__vfs[normalized]) return true;
+  
+  // Проверяем все варианты пути
+  for (const vfsPath of Object.keys(__vfs)) {
+    if (vfsPath.endsWith(normalized) || normalized.endsWith(vfsPath)) {
+      return true;
+    }
+  }
+  
+  return false;
+}
+
+// Получение файла из VFS
+function getFromVFS(filePath) {
+  const normalized = normalizePath(filePath);
   
   if (__vfs[normalized]) {
-    const data = Buffer.from(__vfs[normalized].content, __vfs[normalized].encoding);
+    return __vfs[normalized];
+  }
+  
+  // Ищем по окончанию пути
+  for (const [vfsPath, data] of Object.entries(__vfs)) {
+    if (vfsPath.endsWith(normalized) || normalized.endsWith(vfsPath)) {
+      return data;
+    }
+  }
+  
+  return null;
+}
+
+// ===== ПЕРЕХВАТ fs.readFileSync =====
+originalFs.readFileSync = function(filePath, options) {
+  const vfsData = getFromVFS(filePath);
+  
+  if (vfsData) {
+    const data = Buffer.from(vfsData.content, vfsData.encoding);
     if (options === "utf8" || options?.encoding === "utf8") {
       return data.toString("utf8");
     }
     return data;
   }
   
-  return originalReadFileSync(filePath, options);
+  return originalReadFileSync.call(this, filePath, options);
 };
 
-fs.promises.readFile = async function(filePath, options) {
-  const normalized = filePath.toString().replace(/\\\\/g, "/");
+// ===== ПЕРЕХВАТ fs.promises.readFile =====
+originalFs.promises.readFile = async function(filePath, options) {
+  const vfsData = getFromVFS(filePath);
   
-  if (__vfs[normalized]) {
-    const data = Buffer.from(__vfs[normalized].content, __vfs[normalized].encoding);
+  if (vfsData) {
+    const data = Buffer.from(vfsData.content, vfsData.encoding);
     if (options === "utf8" || options?.encoding === "utf8") {
       return data.toString("utf8");
     }
     return data;
   }
   
-  return originalReadFile(filePath, options);
+  return originalReadFile.call(this, filePath, options);
+};
+
+// ===== ПЕРЕХВАТ fs.existsSync =====
+originalFs.existsSync = function(filePath) {
+  if (isInVFS(filePath)) {
+    return true;
+  }
+  return originalExistsSync.call(this, filePath);
+};
+
+// ===== ПЕРЕХВАТ fs.statSync =====
+originalFs.statSync = function(filePath, options) {
+  const vfsData = getFromVFS(filePath);
+  
+  if (vfsData) {
+    const size = Buffer.from(vfsData.content, vfsData.encoding).length;
+    return {
+      isFile: () => true,
+      isDirectory: () => false,
+      isSymbolicLink: () => false,
+      size: size,
+    };
+  }
+  
+  return originalStatSync.call(this, filePath, options);
+};
+
+// ===== ПЕРЕХВАТ fs.readdirSync =====
+originalFs.readdirSync = function(dirPath, options) {
+  const normalized = normalizePath(dirPath);
+  const files = new Set();
+  
+  // Ищем файлы в VFS с этим префиксом
+  for (const vfsPath of Object.keys(__vfs)) {
+    if (vfsPath.startsWith(normalized + "/")) {
+      const relativePath = vfsPath.slice(normalized.length + 1);
+      const firstPart = relativePath.split("/")[0];
+      files.add(firstPart);
+    }
+  }
+  
+  if (files.size > 0) {
+    return Array.from(files);
+  }
+  
+  return originalReaddirSync.call(this, dirPath, options);
+};
+
+// Экспортируем перехваченный fs
+export default originalFs;
+export const readFileSync = originalFs.readFileSync;
+export const readFile = originalFs.promises.readFile;
+export const existsSync = originalFs.existsSync;
+export const statSync = originalFs.statSync;
+export const readdirSync = originalFs.readdirSync;
+export const promises = {
+  readFile: originalFs.promises.readFile,
+  readdir: originalFs.promises.readdir,
 };
 `;
 }
 
 /**
- * Main bundle func
+ * Главная функция бандлинга
  */
 export async function bundle(appDir, outputDir) {
   console.log("🔍 Finding entry point...");
@@ -182,7 +348,7 @@ export async function bundle(appDir, outputDir) {
   console.log(`   Entry: ${path.relative(appDir, entryPoint)}`);
 
   console.log("📂 Collecting static assets...");
-  const assets = await collectStaticAssets(appDir);
+  const assets = await collectAllAssets(appDir);
   console.log(`   Found ${assets.size} files`);
 
   const outputPath = path.join(outputDir, "bundle.js");
@@ -190,7 +356,7 @@ export async function bundle(appDir, outputDir) {
 
   console.log("🔨 Bundling with esbuild...");
   
-  const vfsCode = generateVFSCode(assets);
+  const vfsCode = generateVFSCode(assets, appDir);
 
   await esbuild.build({
     entryPoints: [entryPoint],
@@ -204,7 +370,6 @@ export async function bundle(appDir, outputDir) {
 import { createRequire } from "module";
 import { fileURLToPath } from "url";
 import { dirname } from "path";
-import fs from "fs";
 
 const require = createRequire(import.meta.url);
 const __filename = fileURLToPath(import.meta.url);
@@ -213,17 +378,18 @@ const __dirname = dirname(__filename);
 ${vfsCode}
       `.trim(),
     },
-    plugins: [virtualFileSystemPlugin],
+    external: [],
     minify: false,
     sourcemap: false,
     logLevel: "info",
+    mainFields: ["module", "main"],
   });
 
   console.log(`✅ Bundle created: ${outputPath}`);
   return outputPath;
 }
 
-// CLI interface
+// CLI интерфейс
 if (import.meta.url === `file://${process.argv[1]}`) {
   const appDir = process.argv[2];
   const outputDir = process.argv[3] || "./dist";
@@ -234,7 +400,8 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   }
 
   bundle(appDir, outputDir).catch((err) => {
-    console.error("❌ Error:", err.message);
+    console.error("❌ Error:", err);
+    console.error(err.stack);
     process.exit(1);
   });
 }

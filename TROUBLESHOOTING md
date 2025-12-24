@@ -1,0 +1,370 @@
+# 🔧 Troubleshooting Guide
+
+## Проблемы с path.join(__dirname, ...)
+
+### Симптом
+```
+Error: ENOENT: no such file or directory, open '/snapshot/app/migrations/001_init.sql'
+```
+
+### Решение
+
+Проблема возникает потому что VFS не перехватывает пути корректно. Проверьте:
+
+1. **Используете ли вы правильный паттерн:**
+   ```javascript
+   // ✅ ПРАВИЛЬНО
+   const migrationPath = path.join(__dirname, './migrations/001_init.sql');
+   const data = fs.readFileSync(migrationPath, 'utf8');
+   
+   // ❌ НЕПРАВИЛЬНО (не будет работать)
+   const data = fs.readFileSync('./migrations/001_init.sql', 'utf8');
+   ```
+
+2. **Проверьте, что файлы собраны в bundle:**
+   ```bash
+   # Проверьте dist/bundle.js
+   grep -o "migrations" dist/bundle.js
+   # Должны увидеть упоминания VFS
+   ```
+
+3. **Добавьте debug вывод в ваше приложение:**
+   ```javascript
+   console.log('__dirname:', __dirname);
+   console.log('Looking for:', path.join(__dirname, './migrations'));
+   console.log('Exists:', fs.existsSync(path.join(__dirname, './migrations')));
+   ```
+
+## Проблемы с ESM vs CJS
+
+### Симптом
+```
+require is not defined in ES module scope
+```
+
+### Решение
+
+npack автоматически добавляет `createRequire`, но если проблемы:
+
+```javascript
+// В начале вашего index.js:
+import { createRequire } from 'module';
+import { fileURLToPath } from 'url';
+import { dirname } from 'path';
+
+const require = createRequire(import.meta.url);
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+```
+
+## Файлы не находятся в runtime
+
+### Симптом
+Файлы существуют в проекте, но не находятся в executable
+
+### Решение
+
+1. **Проверьте, что файлы в стандартных директориях:**
+   - `config/`
+   - `migrations/`
+   - `templates/`
+   - `public/`
+   - `assets/`
+   - `data/`
+
+2. **Добавьте свою директорию в bundler/index.js:**
+   ```javascript
+   // В функции collectAllAssets
+   const commonDirs = [
+     "config", "migrations", "templates", 
+     "your-custom-dir"  // ← добавьте здесь
+   ];
+   ```
+
+3. **Проверьте расширения файлов:**
+   ```javascript
+   // Нестандартные расширения автоматически включаются:
+   const nonCodeExtensions = [
+     ".sql", ".json", ".yaml", ".yml", ".xml", 
+     ".txt", ".md", ".csv", ".env", ".pem"
+   ];
+   ```
+
+## Ошибки сборки
+
+### error: Error calling dlltool 'dlltool.exe': program not found error: could not compile windows-sys (lib) due to 1 previous error warning: build failed, waiting for other jobs to finish...
+
+```bash
+rustup default stable-x86_64-pc-windows-msvc
+```
+
+### "Cannot find bundler/index.js"
+
+```bash
+# Проверьте путь
+ls -la bundler/index.js
+
+# Если файл есть, но ошибка остаётся, проверьте Rust код:
+# В src/main.rs функция get_bundler_path() ищет bundler
+# относительно executable
+```
+
+### "esbuild not found"
+
+```bash
+cd bundler
+npm install
+# или
+npm install esbuild @babel/parser @babel/traverse
+```
+
+### "Bundling failed"
+
+```bash
+# Запустите bundler вручную для debug:
+node bundler/index.js ./example ./dist
+
+# Смотрите подробный вывод:
+node bundler/index.js ./your-app ./dist 2>&1 | tee bundle.log
+```
+
+## Ошибки SEA
+
+### "SEA creation failed"
+
+1. **Проверьте версию Node.js:**
+   ```bash
+   node --version
+   # Должна быть >= 18.16.0
+   ```
+
+2. **Проверьте bundle.js:**
+   ```bash
+   node dist/bundle.js
+   # Должен запуститься без ошибок
+   ```
+
+3. **Проверьте sea-config.json:**
+   ```bash
+   cat dist/sea-config.json
+   # Должен содержать правильные пути
+   ```
+
+### "postject failed"
+
+```bash
+# Установите postject глобально
+npm install -g postject
+
+# Или используйте npx явно:
+npx postject --version
+```
+
+## Проблемы с платформами
+
+### macOS: "cannot be opened because the developer cannot be verified"
+
+```bash
+# Удалите quarantine атрибут:
+xattr -d com.apple.quarantine ./dist/app-macos
+
+# Или удалите подпись и пересоберите:
+codesign --remove-signature ./dist/app-macos
+```
+
+### Windows: "postject failed"
+
+На Windows может потребоваться Visual Studio Build Tools:
+
+```bash
+# Установите через:
+npm install --global windows-build-tools
+
+# Или скачайте VS Build Tools:
+# https://visualstudio.microsoft.com/downloads/
+```
+
+### Linux: "Permission denied"
+
+```bash
+# Сделайте файл исполняемым:
+chmod +x ./dist/app-linux
+```
+
+## Runtime ошибки
+
+### "Module not found"
+
+Если в runtime не находится модуль:
+
+1. **Проверьте external в esbuild:**
+   ```javascript
+   // В bundler/index.js
+   await esbuild.build({
+     // ...
+     external: [],  // ← Должно быть пусто для полного bundle
+   });
+   ```
+
+2. **Некоторые native модули не могут быть забандлены:**
+   - `sqlite3`
+   - `sharp`
+   - `canvas`
+   
+   Для них используйте `external: ['sqlite3']` и включите в dist
+
+### "Dynamic require is not supported"
+
+Esbuild не может статически разрешить динамический require:
+
+```javascript
+// ❌ НЕ РАБОТАЕТ
+const moduleName = getModuleName();
+const mod = require(moduleName);
+
+// ✅ РАБОТАЕТ
+const mod = require('./specific-module');
+```
+
+## Git проблемы
+
+### "Git clone failed"
+
+```bash
+# Проверьте доступ к репозиторию:
+git clone https://github.com/user/repo.git /tmp/test
+
+# Для приватных репозиториев используйте SSH:
+npack git@github.com:user/private-repo.git --platform all
+```
+
+### "Cannot find entry point" после clone
+
+```bash
+# Убедитесь, что в репозитории есть package.json
+# с полями "main" или "bin"
+```
+
+## Performance проблемы
+
+### Долгая сборка
+
+```bash
+# Используйте --skip-bundle для пересборки без бандлинга:
+npack ./app --platform all --skip-bundle
+
+# Или соберите только для нужной платформы:
+npack ./app --platform linux
+```
+
+### Большой размер executable
+
+1. **Используйте minify:**
+   ```javascript
+   // В bundler/index.js
+   await esbuild.build({
+     // ...
+     minify: true,  // ← включите
+   });
+   ```
+
+2. **Исключите ненужные файлы:**
+   ```javascript
+   // Отредактируйте commonDirs в collectAllAssets
+   // Удалите ненужные директории
+   ```
+
+3. **Используйте UPX (опционально):**
+   ```bash
+   upx --best ./dist/app-linux
+   # Может уменьшить размер на 50-70%
+   ```
+
+## Debug режим
+
+### Включите подробный вывод
+
+```bash
+# В bundler добавьте console.log везде:
+# bundler/index.js
+
+console.log('Collected files:', Array.from(assets.keys()));
+console.log('VFS size:', assets.size);
+```
+
+### Проверьте содержимое bundle
+
+```bash
+# Посмотрите, что внутри bundle.js:
+head -n 100 dist/bundle.js
+
+# Поищите VFS:
+grep -A 10 "__vfs" dist/bundle.js
+```
+
+### Запустите bundle напрямую
+
+```bash
+# Без SEA, просто через Node:
+node dist/bundle.js
+
+# Должно работать так же, как и executable
+```
+
+## Известные ограничения
+
+1. **Native модули** - требуют отдельной обработки
+2. **Динамический import()** - может не работать
+3. **Worker threads с внешними файлами** - требуют дополнительной настройки
+4. **fs.watch / fs.watchFile** - не работают с VFS
+5. **child_process с относительными путями** - могут быть проблемы
+
+## Получить помощь
+
+Если проблема не решена:
+
+1. **Создайте minimal reproducible example:**
+   ```bash
+   # Минимальный проект с проблемой
+   mkdir test-app && cd test-app
+   npm init -y
+   # ... добавьте минимальный код с проблемой
+   ```
+
+2. **Соберите debug информацию:**
+   ```bash
+   node --version
+   cargo --version
+   npm --version
+   uname -a
+   ```
+
+3. **Откройте issue на GitHub** с:
+   - Описанием проблемы
+   - Шагами для воспроизведения
+   - Debug информацией
+   - Minimal example
+
+---
+
+## Полезные команды для debug
+
+```bash
+# Проверить содержимое executable (Linux/macOS)
+strings ./dist/app-linux | grep "NODE_SEA"
+
+# Проверить размер секций
+size ./dist/app-linux
+
+# Проверить зависимости (Linux)
+ldd ./dist/app-linux
+
+# Проверить зависимости (macOS)
+otool -L ./dist/app-macos
+
+# Trace системные вызовы (Linux)
+strace ./dist/app-linux
+
+# Trace системные вызовы (macOS)
+dtruss ./dist/app-macos
+```
