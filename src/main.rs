@@ -27,7 +27,7 @@ struct Args {
     skip_bundle: bool,
 
     /// Node.js version to use (e.g., 20, 22, 24 — will use latest patch)
-    #[arg(long, default_value = "20")]
+    #[arg(long, default_value = "24")]
     node_version: String,
 }
 
