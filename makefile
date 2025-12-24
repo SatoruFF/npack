@@ -49,6 +49,9 @@ clean:
 	rm -rf dist test-dist temp_clone
 	rm -rf example/node_modules
 
+local:
+	cargo run -- ./example --platform host
+
 # Показать справку
 help:
 	@echo "Available commands:"
