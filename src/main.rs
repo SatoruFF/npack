@@ -37,58 +37,78 @@ struct SEAConfig {
     disable_experimental_sea_warning: bool,
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // println!("{:?}", std::env::var("PATH"));
+fn main() {
+    let output = PathBuf::from("./dist");
+    if let Err(e) = run() {
+        eprintln!("❌ Error: {}", e);
+        // Удаляем dist
+        if output.exists() {
+            if let Err(err) = fs::remove_dir_all(&output) {
+                eprintln!("⚠️ Failed to remove {:?}: {}", output, err);
+            } else {
+                println!("🗑 Removed {:?}", output);
+            }
+        }
+        std::process::exit(1); // завершаем с кодом ошибки
+    }
+}
 
+fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
-    println!("📦 npack v0.1.0");
-    println!();
+    println!("📦 npack v0.1.0\n");
 
     // Создаем output директорию
-    fs::create_dir_all(&args.output)?;
+    fs::create_dir_all(&args.output)
+        .map_err(|e| format!("Failed to create output directory {:?}: {}", args.output, e))?;
 
-    // Определяем, это Git URL или локальный путь
+    // Определяем путь к приложению
     let app_path = if args.input.starts_with("http") || args.input.starts_with("git@") {
         println!("🔄 Cloning repository...");
-        clone_repository(&args.input, &args.output)?
+        clone_repository(&args.input, &args.output)
+            .map_err(|e| format!("Git clone failed: {}", e))?
     } else {
         PathBuf::from(&args.input)
     };
 
     println!("   App: {:?}", app_path);
     println!("   Platform: {}", args.platform);
-    println!("   Node version: {}", args.node_version);
-    println!();
+    println!("   Node version: {}\n", args.node_version);
 
-    // Шаг 1: Установка зависимостей
+    // Шаг 1: установка зависимостей
     if !args.skip_bundle {
         println!("📥 Installing dependencies...");
-        install_dependencies(&app_path)?;
+        install_dependencies(&app_path)
+            .map_err(|e| format!("Installing dependencies failed: {}", e))?;
     }
 
-    // Шаг 2: Bundling с esbuild
+    // Шаг 2: Bundling
     let bundle_path = if !args.skip_bundle {
         println!("\n🔨 Bundling with esbuild...");
-        bundle_app(&app_path, &args.output)?
+        bundle_app(&app_path, &args.output)
+            .map_err(|e| format!("Bundling failed: {}", e))?
     } else {
         println!("⏭️  Skipping bundle step");
         args.output.join("bundle.js")
     };
 
-    // Шаг 3: Создание Node.js SEA
+    // Шаг 3: Создание SEA
     println!("\n📦 Creating Node.js SEA...");
-    let sea_blob = create_sea(&bundle_path, &args.output)?;
+    let sea_blob = create_sea(&bundle_path, &args.output)
+        .map_err(|e| format!("SEA creation failed: {}", e))?;
 
-    // Шаг 4: Создание platform executables
+    // Шаг 4: Создание executables
     println!("\n🎯 Creating platform executables...");
-    create_executables(&args.platform, &sea_blob, &args.output, &args.node_version)?;
+    create_executables(&args.platform, &sea_blob, &args.output, &args.node_version)
+        .map_err(|e| format!("Creating executables failed: {}", e))?;
 
     println!("\n✅ Done! Executables:");
-    list_executables(&args.output)?;
+    list_executables(&args.output)
+        .map_err(|e| format!("Listing executables failed: {}", e))?;
 
     Ok(())
 }
+
 
 /// Клонирует Git репозиторий
 fn clone_repository(url: &str, output: &PathBuf) -> Result<PathBuf, Box<dyn std::error::Error>> {
@@ -124,11 +144,19 @@ fn install_dependencies(app_path: &PathBuf) -> Result<(), Box<dyn std::error::Er
         return Ok(());
     }
 
-    let status = Command::new("npm")
-        .arg("install")
-        .arg("--production")
-        .current_dir(app_path)
-        .status()?;
+    let status = {
+        #[cfg(windows)]
+        let npm_cmd = "npm.cmd";
+        #[cfg(not(windows))]
+        let npm_cmd = "npm";
+
+        Command::new(npm_cmd)
+            .arg("install")
+            .arg("--production")
+            .current_dir(app_path)
+            .status()?
+        };
+
 
     if !status.success() {
         return Err("npm install failed".into());
