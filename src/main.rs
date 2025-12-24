@@ -170,6 +170,10 @@ fn install_dependencies(app_path: &PathBuf) -> Result<(), Box<dyn std::error::Er
 fn bundle_app(app_path: &PathBuf, output: &PathBuf) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let bundler_path = get_bundler_path()?;
 
+    println!("Bundler path: {:?}", bundler_path);
+    println!("App path: {:?}", app_path);
+    println!("Output path: {:?}", output);
+
     let status = Command::new("node")
         .arg(&bundler_path)
         .arg(app_path)
