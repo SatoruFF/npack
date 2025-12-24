@@ -1,64 +1,16 @@
-import esbuild from "esbuild";
+import swc from "@swc/core";
 import fs from "fs/promises";
 import path from "path";
-import { parse } from "@babel/parser";
-import traverse from "@babel/traverse";
-
-/**
- * Анализирует код и находит все динамические пути
- */
-async function analyzeDynamicPaths(filePath) {
-  const source = await fs.readFile(filePath, "utf8");
-  const dynamicPaths = new Set();
-  
-  try {
-    const ast = parse(source, {
-      sourceType: "unambiguous",
-      plugins: ["typescript", "jsx"],
-    });
-
-    traverse.default(ast, {
-      CallExpression(path) {
-        const callee = path.node.callee;
-        
-        // Ищем path.join(__dirname, ...)
-        if (
-          callee.type === "MemberExpression" &&
-          callee.object.name === "path" &&
-          callee.property.name === "join"
-        ) {
-          const args = path.node.arguments;
-          if (args.length >= 2 && args[0].name === "__dirname") {
-            if (args[1].type === "StringLiteral") {
-              dynamicPaths.add(args[1].value);
-            }
-          }
-        }
-        
-        // Ищем fs.readFileSync/readFile
-        if (
-          callee.type === "MemberExpression" &&
-          (callee.property.name === "readFileSync" || 
-           callee.property.name === "readFile")
-        ) {
-          // Пометить файл как использующий динамические пути
-          dynamicPaths.add("__dynamic__");
-        }
-      },
-    });
-  } catch (e) {
-    console.warn(`Cannot parse ${filePath}: ${e.message}`);
-  }
-
-  return dynamicPaths;
-}
+import * as babelParser from "@babel/parser";
+import babelGenerate from "@babel/generator";
+import babelTraverse from "@babel/traverse";
 
 /**
  * Собирает все статические ассеты и динамически найденные файлы
  */
 async function collectAllAssets(appDir, scannedFiles = new Set()) {
   const assets = new Map();
-  
+
   // Стандартные директории со статикой
   const commonDirs = [
     "config", "templates", "public", "assets", "data", 
@@ -172,9 +124,9 @@ async function findEntryPoint(appDir) {
 }
 
 /**
- * Генерирует VFS код с полным перехватом путей
+ * Генерирует VFS код с полным перехватом путей (уникальные имена)
  */
-function generateVFSCode(assets, appDir) {
+function generateVFSCode(assets) {
   const entries = Array.from(assets.entries()).map(([filePath, data]) => {
     return `  ${JSON.stringify(filePath)}: {
     content: ${JSON.stringify(data.content)},
@@ -183,32 +135,38 @@ function generateVFSCode(assets, appDir) {
   });
 
   return `
-// ========== VIRTUAL FILE SYSTEM ==========
-const __vfs = {
+// ========== NPACK VIRTUAL FILE SYSTEM ==========
+const __NPACK_VFS = {
 ${entries.join(",\n")}
 };
 
-// Оригинальные функции
-import { Buffer } from "buffer";
-import * as originalFs from "fs";
-const originalReadFileSync = originalFs.readFileSync;
-const originalReadFile = originalFs.promises.readFile;
-const originalExistsSync = originalFs.existsSync;
-const originalStatSync = originalFs.statSync;
-const originalReaddirSync = originalFs.readdirSync;
+const { Buffer } = require("buffer");
+const __NPACK_ORIG_FS = require("fs");
+const __NPACK_READFILE_SYNC = __NPACK_ORIG_FS.readFileSync;
+const __NPACK_READFILE = __NPACK_ORIG_FS.promises.readFile;
+const __NPACK_EXISTS_SYNC = __NPACK_ORIG_FS.existsSync;
+const __NPACK_STAT_SYNC = __NPACK_ORIG_FS.statSync;
+const __NPACK_READDIR_SYNC = __NPACK_ORIG_FS.readdirSync;
+const __NPACK_READDIR = __NPACK_ORIG_FS.promises.readdir;
 
-// Нормализация путей
-function normalizePath(filePath) {
+// Нормализация путей (с поддержкой абсолютных)
+function __NPACK_normalizePath(filePath) {
   if (!filePath) return filePath;
   
   let normalized = filePath.toString().replace(/\\\\/g, "/");
   
-  // Убираем префикс file://
   if (normalized.startsWith("file://")) {
     normalized = normalized.slice(7);
   }
   
-  // Если путь относительный, делаем его абсолютным относительно __dirname
+  // ✅ Если путь абсолютный и содержит __dirname, вырезаем префикс
+  if (normalized.startsWith(__dirname)) {
+    normalized = normalized.slice(__dirname.length);
+  }
+  
+  // Убираем двойные слэши
+  normalized = normalized.replace(/\\/\\/+/g, "/");
+  
   if (!normalized.startsWith("/")) {
     normalized = "/" + normalized;
   }
@@ -216,14 +174,12 @@ function normalizePath(filePath) {
   return normalized;
 }
 
-// Проверка наличия файла в VFS
-function isInVFS(filePath) {
-  const normalized = normalizePath(filePath);
-  if (__vfs[normalized]) return true;
+function __NPACK_isInVFS(filePath) {
+  const normalized = __NPACK_normalizePath(filePath);
+  if (__NPACK_VFS[normalized]) return true;
   
-  // Проверяем все варианты пути
-  for (const vfsPath of Object.keys(__vfs)) {
-    if (vfsPath.endsWith(normalized) || normalized.endsWith(vfsPath)) {
+  for (const vfsPath of Object.keys(__NPACK_VFS)) {
+    if (vfsPath === normalized || vfsPath.endsWith(normalized) || normalized.endsWith(vfsPath)) {
       return true;
     }
   }
@@ -231,17 +187,15 @@ function isInVFS(filePath) {
   return false;
 }
 
-// Получение файла из VFS
-function getFromVFS(filePath) {
-  const normalized = normalizePath(filePath);
+function __NPACK_getFromVFS(filePath) {
+  const normalized = __NPACK_normalizePath(filePath);
   
-  if (__vfs[normalized]) {
-    return __vfs[normalized];
+  if (__NPACK_VFS[normalized]) {
+    return __NPACK_VFS[normalized];
   }
   
-  // Ищем по окончанию пути
-  for (const [vfsPath, data] of Object.entries(__vfs)) {
-    if (vfsPath.endsWith(normalized) || normalized.endsWith(vfsPath)) {
+  for (const [vfsPath, data] of Object.entries(__NPACK_VFS)) {
+    if (vfsPath === normalized || vfsPath.endsWith(normalized) || normalized.endsWith(vfsPath)) {
       return data;
     }
   }
@@ -249,10 +203,27 @@ function getFromVFS(filePath) {
   return null;
 }
 
-// ===== ПЕРЕХВАТ fs.readFileSync =====
-originalFs.readFileSync = function(filePath, options) {
-  const vfsData = getFromVFS(filePath);
+function __NPACK_listVFSDir(dirPath) {
+  const normalized = __NPACK_normalizePath(dirPath);
+  const files = new Set();
   
+  // ✅ Ищем файлы в VFS с этим префиксом
+  for (const vfsPath of Object.keys(__NPACK_VFS)) {
+    // Точное совпадение директории или поддиректория
+    if (vfsPath.startsWith(normalized + "/") || (normalized === "/" && vfsPath.startsWith("/"))) {
+      const relativePath = vfsPath.slice(normalized.length + 1);
+      if (relativePath) {
+        const firstPart = relativePath.split("/")[0];
+        files.add(firstPart);
+      }
+    }
+  }
+  
+  return files.size > 0 ? Array.from(files) : null;
+}
+
+__NPACK_ORIG_FS.readFileSync = function(filePath, options) {
+  const vfsData = __NPACK_getFromVFS(filePath);
   if (vfsData) {
     const data = Buffer.from(vfsData.content, vfsData.encoding);
     if (options === "utf8" || options?.encoding === "utf8") {
@@ -260,14 +231,11 @@ originalFs.readFileSync = function(filePath, options) {
     }
     return data;
   }
-  
-  return originalReadFileSync.call(this, filePath, options);
+  return __NPACK_READFILE_SYNC.call(this, filePath, options);
 };
 
-// ===== ПЕРЕХВАТ fs.promises.readFile =====
-originalFs.promises.readFile = async function(filePath, options) {
-  const vfsData = getFromVFS(filePath);
-  
+__NPACK_ORIG_FS.promises.readFile = async function(filePath, options) {
+  const vfsData = __NPACK_getFromVFS(filePath);
   if (vfsData) {
     const data = Buffer.from(vfsData.content, vfsData.encoding);
     if (options === "utf8" || options?.encoding === "utf8") {
@@ -275,22 +243,18 @@ originalFs.promises.readFile = async function(filePath, options) {
     }
     return data;
   }
-  
-  return originalReadFile.call(this, filePath, options);
+  return __NPACK_READFILE.call(this, filePath, options);
 };
 
-// ===== ПЕРЕХВАТ fs.existsSync =====
-originalFs.existsSync = function(filePath) {
-  if (isInVFS(filePath)) {
+__NPACK_ORIG_FS.existsSync = function(filePath) {
+  if (__NPACK_isInVFS(filePath)) {
     return true;
   }
-  return originalExistsSync.call(this, filePath);
+  return __NPACK_EXISTS_SYNC.call(this, filePath);
 };
 
-// ===== ПЕРЕХВАТ fs.statSync =====
-originalFs.statSync = function(filePath, options) {
-  const vfsData = getFromVFS(filePath);
-  
+__NPACK_ORIG_FS.statSync = function(filePath, options) {
+  const vfsData = __NPACK_getFromVFS(filePath);
   if (vfsData) {
     const size = Buffer.from(vfsData.content, vfsData.encoding).length;
     return {
@@ -300,44 +264,27 @@ originalFs.statSync = function(filePath, options) {
       size: size,
     };
   }
-  
-  return originalStatSync.call(this, filePath, options);
+  return __NPACK_STAT_SYNC.call(this, filePath, options);
 };
 
-// ===== ПЕРЕХВАТ fs.readdirSync =====
-originalFs.readdirSync = function(dirPath, options) {
-  const normalized = normalizePath(dirPath);
-  const files = new Set();
-  
-  // Ищем файлы в VFS с этим префиксом
-  for (const vfsPath of Object.keys(__vfs)) {
-    if (vfsPath.startsWith(normalized + "/")) {
-      const relativePath = vfsPath.slice(normalized.length + 1);
-      const firstPart = relativePath.split("/")[0];
-      files.add(firstPart);
-    }
+__NPACK_ORIG_FS.readdirSync = function(dirPath, options) {
+  const vfsFiles = __NPACK_listVFSDir(dirPath);
+  if (vfsFiles) {
+    return vfsFiles;
   }
-  
-  if (files.size > 0) {
-    return Array.from(files);
-  }
-  
-  return originalReaddirSync.call(this, dirPath, options);
+  return __NPACK_READDIR_SYNC.call(this, dirPath, options);
 };
 
-// Экспортируем перехваченный fs
-export default originalFs;
-export const readFileSync = originalFs.readFileSync;
-export const readFile = originalFs.promises.readFile;
-export const existsSync = originalFs.existsSync;
-export const statSync = originalFs.statSync;
-export const readdirSync = originalFs.readdirSync;
-export const promises = {
-  readFile: originalFs.promises.readFile,
-  readdir: originalFs.promises.readdir,
+__NPACK_ORIG_FS.promises.readdir = async function(dirPath, options) {
+  const vfsFiles = __NPACK_listVFSDir(dirPath);
+  if (vfsFiles) {
+    return vfsFiles;
+  }
+  return __NPACK_READDIR.call(this, dirPath, options);
 };
 `;
 }
+
 
 /**
  * Главная функция бандлинга
@@ -354,40 +301,148 @@ export async function bundle(appDir, outputDir) {
   const outputPath = path.join(outputDir, "bundle.js");
   await fs.mkdir(outputDir, { recursive: true });
 
-  console.log("🔨 Bundling with esbuild...");
-  
-  const vfsCode = generateVFSCode(assets, appDir);
+  console.log("🔨 Bundling with SWC...");
 
-  await esbuild.build({
-    entryPoints: [entryPoint],
-    bundle: true,
-    platform: "node",
-    format: "esm",
-    outfile: outputPath,
-    target: "node20",
-    banner: {
-      js: `
-import { createRequire } from "module";
-import { fileURLToPath } from "url";
-import { dirname } from "path";
-
-const require = createRequire(import.meta.url);
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
-
-${vfsCode}
-      `.trim(),
+  const result = await swc.transformFile(entryPoint, {
+    jsc: {
+      target: "es2022",
+      parser: {
+        syntax: "ecmascript",
+        dynamicImport: true,
+      },
+      transform: {
+        legacyDecorator: false,
+        decoratorMetadata: false,
+      },
     },
-    external: [],
-    minify: false,
-    sourcemap: false,
-    logLevel: "info",
-    mainFields: ["module", "main"],
+    module: {
+      type: "commonjs",
+    },
+    sourceMaps: false,
+    inlineSourcesContent: false,
   });
 
+  // ✅ AST-очистка (полная версия с заменой всех _path/_url)
+  const ast = babelParser.parse(result.code, {
+    sourceType: "module",
+    plugins: [],
+  });
+
+  babelTraverse.default(ast, {
+    // 1. Удаляем объявления переменных
+    VariableDeclaration(path) {
+      const declarations = path.node.declarations;
+      
+      const filtered = declarations.filter(decl => {
+        if (decl.id.type === 'Identifier') {
+          const name = decl.id.name;
+          return name !== '__dirname' && 
+                 name !== '__filename' && 
+                 name !== '__filename1' &&
+                 name !== '_url' && 
+                 name !== '_path';
+        }
+        return true;
+      });
+
+      if (filtered.length === 0) {
+        path.remove();
+      } else if (filtered.length !== declarations.length) {
+        path.node.declarations = filtered;
+      }
+    },
+
+    // 2. Заменяем ВСЕ _path.* и _path.default.*
+    MemberExpression(path) {
+      const { object, property } = path.node;
+      
+      // _path.default.join/dirname/etc → require('path').join/dirname
+      if (object.type === 'MemberExpression' &&
+          object.object.name === '_path' &&
+          object.property.name === 'default') {
+        path.node.object = {
+          type: 'CallExpression',
+          callee: { type: 'Identifier', name: 'require' },
+          arguments: [{ type: 'StringLiteral', value: 'path' }]
+        };
+      }
+      
+      // _path.join/dirname → require('path').join/dirname
+      if (object.name === '_path') {
+        path.node.object = {
+          type: 'CallExpression',
+          callee: { type: 'Identifier', name: 'require' },
+          arguments: [{ type: 'StringLiteral', value: 'path' }]
+        };
+      }
+
+      // _url.default.fileURLToPath → удаляем полностью (см. CallExpression)
+      if (object.type === 'MemberExpression' &&
+          object.object.name === '_url' &&
+          object.property.name === 'default') {
+        // Обработается в CallExpression
+      }
+    },
+
+    // 3. Заменяем вызовы _url.fileURLToPath на __filename
+    CallExpression(path) {
+      const { callee } = path.node;
+      
+      // (0, _url.fileURLToPath)(...) → __filename
+      if (callee.type === 'SequenceExpression') {
+        const lastExpr = callee.expressions[callee.expressions.length - 1];
+        if (lastExpr.type === 'MemberExpression' &&
+            lastExpr.object?.name === '_url' &&
+            lastExpr.property?.name === 'fileURLToPath') {
+          path.replaceWith({
+            type: 'Identifier',
+            name: '__filename'
+          });
+        }
+      }
+      
+      // _url.fileURLToPath(...) → __filename
+      if (callee.type === 'MemberExpression' &&
+          callee.object.name === '_url' &&
+          callee.property.name === 'fileURLToPath') {
+        path.replaceWith({
+          type: 'Identifier',
+          name: '__filename'
+        });
+      }
+
+      // _url.default.fileURLToPath(...) → __filename
+      if (callee.type === 'MemberExpression' &&
+          callee.object?.type === 'MemberExpression' &&
+          callee.object.object?.name === '_url' &&
+          callee.object.property?.name === 'default' &&
+          callee.property?.name === 'fileURLToPath') {
+        path.replaceWith({
+          type: 'Identifier',
+          name: '__filename'
+        });
+      }
+    }
+  });
+
+  const cleanedCode = babelGenerate.default(ast, {
+    retainLines: false,
+    compact: false,
+  }).code;
+
+  const finalCode = `
+console.log("🛡️ VFS LOADED");
+
+${generateVFSCode(assets).trim()}
+
+${cleanedCode}
+  `.trim();
+
+  await fs.writeFile(outputPath, finalCode, "utf8");
   console.log(`✅ Bundle created: ${outputPath}`);
   return outputPath;
 }
+
 
 // CLI интерфейс
 if (import.meta.url === `file://${process.argv[1]}`) {

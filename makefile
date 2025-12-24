@@ -50,7 +50,7 @@ clean:
 	rm -rf example/node_modules
 
 local:
-	cargo run -- ./example --platform host
+	cargo run -- ./example --platform host && ./dist/app-macos
 
 # Показать справку
 help:

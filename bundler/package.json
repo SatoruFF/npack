@@ -1,11 +1,28 @@
 {
   "name": "npack-bundler",
-  "version": "0.1.0",
+  "version": "0.0.1",
   "type": "module",
   "description": "Internal bundler for npack",
+  "scripts": {
+    "lint": "biome lint .",
+    "format": "biome format --write .",
+    "check": "biome check --write .",
+    "prepare": "husky"
+  },
+  "lint-staged": {
+    "*.{js,ts,jsx,tsx,json}": [
+      "biome check --write --no-errors-on-unmatched"
+    ]
+  },
   "dependencies": {
-    "esbuild": "^0.24.2",
+    "@babel/generator": "^7.28.5",
     "@babel/parser": "^7.26.3",
-    "@babel/traverse": "^7.26.5"
+    "@babel/traverse": "^7.26.5",
+    "@swc/core": "^1.15.7"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.3.10",
+    "husky": "^9.1.7",
+    "lint-staged": "^16.2.7"
   }
 }
