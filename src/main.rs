@@ -1,8 +1,10 @@
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use tokio::process::Command as TokioCommand;
 
 #[derive(Parser)]
 #[command(name = "npack")]
@@ -24,7 +26,7 @@ struct Args {
     #[arg(long)]
     skip_bundle: bool,
 
-    /// Node.js version to use (18, 20, 22, 24)
+    /// Node.js version to use (e.g., 20, 22, 24 — will use latest patch)
     #[arg(long, default_value = "20")]
     node_version: String,
 }
@@ -37,11 +39,16 @@ struct SEAConfig {
     disable_experimental_sea_warning: bool,
 }
 
-fn main() {
-    let output = PathBuf::from("./dist");
-    if let Err(e) = run() {
+// Константа для sentinel fuse (из документации Node.js SEA)
+const NODE_SEA_FUSE: &str = "NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2";
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args = Args::parse();
+
+    if let Err(e) = run(args).await {
         eprintln!("❌ Error: {}", e);
-        // Удаляем dist
+        let output = PathBuf::from("./dist");
         if output.exists() {
             if let Err(err) = fs::remove_dir_all(&output) {
                 eprintln!("⚠️ Failed to remove {:?}: {}", output, err);
@@ -49,20 +56,44 @@ fn main() {
                 println!("🗑 Removed {:?}", output);
             }
         }
-        std::process::exit(1); // завершаем с кодом ошибки
+        std::process::exit(1);
     }
+    Ok(())
 }
 
-fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let args = Args::parse();
-
+async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     println!("📦 npack v0.1.0\n");
 
-    // Создаем output директорию
+    // Создаем output директорию СРАЗУ
     fs::create_dir_all(&args.output)
         .map_err(|e| format!("Failed to create output directory {:?}: {}", args.output, e))?;
 
-    // Определяем путь к приложению
+    let target_platform = if args.platform == "host" {
+        std::env::consts::OS
+    } else {
+        &args.platform
+    };
+
+    let (node_arch, _) = match target_platform {
+        "linux" => ("linux-x64", "app-linux"),
+        "macos" | "darwin" => ("darwin-x64", "app-macos"),
+        "windows" => ("win-x64", "app-windows.exe"),
+        _ => return Err(format!("Unsupported platform: {}", target_platform).into()),
+    };
+
+    // Скачиваем node binary
+    let node_binary_path = args.output.join("node-binary");
+    download_node_binary(&args.node_version, node_arch, &node_binary_path).await?;
+
+    // Делаем исполняемым (Unix)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&node_binary_path)?.permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&node_binary_path, perms)?;
+    }
+
     let app_path = if args.input.starts_with("http") || args.input.starts_with("git@") {
         println!("🔄 Cloning repository...");
         clone_repository(&args.input, &args.output)
@@ -75,46 +106,70 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("   Platform: {}", args.platform);
     println!("   Node version: {}\n", args.node_version);
 
-    // Шаг 1: установка зависимостей
     if !args.skip_bundle {
         println!("📥 Installing dependencies...");
         install_dependencies(&app_path)
             .map_err(|e| format!("Installing dependencies failed: {}", e))?;
     }
 
-    // Шаг 2: Bundling
     let bundle_path = if !args.skip_bundle {
         println!("\n🔨 Bundling with esbuild...");
-        bundle_app(&app_path, &args.output)
-            .map_err(|e| format!("Bundling failed: {}", e))?
+        bundle_app(&app_path, &args.output).map_err(|e| format!("Bundling failed: {}", e))?
     } else {
         println!("⏭️  Skipping bundle step");
         args.output.join("bundle.js")
     };
 
-    // Шаг 3: Создание SEA
     println!("\n📦 Creating Node.js SEA...");
-    let sea_blob = create_sea(&bundle_path, &args.output)
+    let sea_blob = create_sea(&bundle_path, &args.output, &node_binary_path)
         .map_err(|e| format!("SEA creation failed: {}", e))?;
 
-    // Шаг 4: Создание executables
     println!("\n🎯 Creating platform executables...");
-    create_executables(&args.platform, &sea_blob, &args.output, &args.node_version)
-        .map_err(|e| format!("Creating executables failed: {}", e))?;
+    create_executables(
+        &args.platform,
+        &sea_blob,
+        &args.output,
+        &args.node_version,
+        &node_binary_path,
+    )
+    .await
+    .map_err(|e| format!("Creating executables failed: {}", e))?;
+
+    // Cleanup временных файлов
+    cleanup_temp_files(&args.output)?;
 
     println!("\n✅ Done! Executables:");
-    list_executables(&args.output)
-        .map_err(|e| format!("Listing executables failed: {}", e))?;
+    list_executables(&args.output).map_err(|e| format!("Listing executables failed: {}", e))?;
 
     Ok(())
 }
 
+fn cleanup_temp_files(output: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let files_to_remove = [
+        "node-binary",
+        "sea-config.json",
+        "sea-prep.blob",
+        "bundle.js",
+    ];
 
-/// Клонирует Git репозиторий
+    for file in &files_to_remove {
+        let path = output.join(file);
+        if path.exists() {
+            fs::remove_file(&path)?;
+        }
+    }
+
+    // Удаляем temp_clone если есть
+    let temp_clone = output.join("temp_clone");
+    if temp_clone.exists() {
+        fs::remove_dir_all(&temp_clone)?;
+    }
+
+    Ok(())
+}
+
 fn clone_repository(url: &str, output: &PathBuf) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let clone_dir = output.join("temp_clone");
-
-    // Удаляем старую директорию если существует
     if clone_dir.exists() {
         fs::remove_dir_all(&clone_dir)?;
     }
@@ -135,28 +190,18 @@ fn clone_repository(url: &str, output: &PathBuf) -> Result<PathBuf, Box<dyn std:
     Ok(clone_dir)
 }
 
-/// Устанавливает npm зависимости
-fn install_dependencies(app_path: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
-    let package_json = app_path.join("package.json");
-    
-    if !package_json.exists() {
+fn install_dependencies(app_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    if !app_path.join("package.json").exists() {
         println!("   No package.json found, skipping npm install");
         return Ok(());
     }
 
-    let status = {
-        #[cfg(windows)]
-        let npm_cmd = "npm.cmd";
-        #[cfg(not(windows))]
-        let npm_cmd = "npm";
-
-        Command::new(npm_cmd)
-            .arg("install")
-            .arg("--production")
-            .current_dir(app_path)
-            .status()?
-        };
-
+    let npm_cmd = if cfg!(windows) { "npm.cmd" } else { "npm" };
+    let status = Command::new(npm_cmd)
+        .arg("install")
+        .arg("--production")
+        .current_dir(app_path)
+        .status()?;
 
     if !status.success() {
         return Err("npm install failed".into());
@@ -166,14 +211,8 @@ fn install_dependencies(app_path: &PathBuf) -> Result<(), Box<dyn std::error::Er
     Ok(())
 }
 
-/// Запускает Node.js bundler
-fn bundle_app(app_path: &PathBuf, output: &PathBuf) -> Result<PathBuf, Box<dyn std::error::Error>> {
+fn bundle_app(app_path: &Path, output: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let bundler_path = get_bundler_path()?;
-
-    println!("Bundler path: {:?}", bundler_path);
-    println!("App path: {:?}", app_path);
-    println!("Output path: {:?}", output);
-
     let status = Command::new("node")
         .arg(&bundler_path)
         .arg(app_path)
@@ -187,90 +226,84 @@ fn bundle_app(app_path: &PathBuf, output: &PathBuf) -> Result<PathBuf, Box<dyn s
     Ok(output.join("bundle.js"))
 }
 
-/// Создает Node.js Single Executable Application blob
 fn create_sea(
-    bundle_path: &PathBuf,
-    output: &PathBuf,
+    bundle_path: &Path,
+    output: &Path,
+    node_binary: &Path,
 ) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let sea_config_path = output.join("sea-config.json");
     let sea_blob_path = output.join("sea-prep.blob");
 
     let config = SEAConfig {
-        main: bundle_path.to_string_lossy().to_string(),
-        output: sea_blob_path.to_string_lossy().to_string(),
+        main: bundle_path.to_string_lossy().into_owned(),
+        output: sea_blob_path.to_string_lossy().into_owned(),
         disable_experimental_sea_warning: true,
     };
 
-    let config_json = serde_json::to_string_pretty(&config)?;
-    fs::write(&sea_config_path, config_json)?;
+    fs::write(&sea_config_path, serde_json::to_string_pretty(&config)?)?;
 
-    println!("   Config: {:?}", sea_config_path);
-
-    let status = Command::new("node")
+    let output = Command::new(node_binary)
         .arg("--experimental-sea-config")
         .arg(&sea_config_path)
-        .status()?;
+        .output()?;
 
-    if !status.success() {
-        return Err("SEA creation failed".into());
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        return Err(format!(
+            "SEA creation failed.\nstdout: {}\nstderr: {}",
+            stdout, stderr
+        )
+        .into());
     }
 
-    println!("   Blob: {:?}", sea_blob_path);
     Ok(sea_blob_path)
 }
 
-/// Создает executable файлы для указанных платформ
-fn create_executables(
+async fn create_executables(
     platform: &str,
-    sea_blob: &PathBuf,
-    output: &PathBuf,
+    sea_blob: &Path,
+    output: &Path,
     node_version: &str,
+    node_binary_path: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    match platform {
-        "windows" => {
-            build_for_platform("windows", sea_blob, output, node_version)?;
-        }
-        "macos" => {
-            build_for_platform("macos", sea_blob, output, node_version)?;
-        }
-        "linux" => {
-            build_for_platform("linux", sea_blob, output, node_version)?;
-        }
+    let platforms = match platform {
+        "all" => vec!["linux", "macos", "windows"],
         "host" => {
-            let current = std::env::consts::OS;
-            build_for_platform(current, sea_blob, output, node_version)?;
+            let os = std::env::consts::OS;
+            vec![if os == "darwin" { "macos" } else { os }]
         }
-        "all" => {
-            build_for_platform("linux", sea_blob, output, node_version)?;
-            build_for_platform("macos", sea_blob, output, node_version)?;
-            build_for_platform("windows", sea_blob, output, node_version)?;
-        }
-        p => build_for_platform(p, sea_blob, output, node_version)?,
+        _ => vec![platform],
+    };
+
+    for p in platforms {
+        build_for_platform(p, sea_blob, output, node_version, node_binary_path).await?;
     }
     Ok(())
 }
 
-/// Создает executable файл для конкретной платформы
-fn build_for_platform(
+async fn build_for_platform(
     platform: &str,
-    sea_blob: &PathBuf,
-    output: &PathBuf,
+    sea_blob: &Path,
+    output: &Path,
     node_version: &str,
+    _node_binary_path: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("   Building for {}...", platform);
 
-    let (output_name, is_windows) = match platform {
-        "linux" => ("app-linux", false),
-        "macos" => ("app-macos", false),
-        "windows" => ("app-windows.exe", true),
-        _ => return Err(format!("Unknown platform: {}", platform).into()),
+    let (output_name, node_arch) = match platform {
+        "linux" => ("app-linux", "linux-x64"),
+        "macos" | "darwin" => ("app-macos", "darwin-x64"),
+        "windows" => ("app-windows.exe", "win-x64"),
+        _ => return Err(format!("Unsupported platform: {}", platform).into()),
     };
 
-    // Копируем Node.js binary
     let exe_path = output.join(output_name);
-    copy_node_binary(&exe_path, node_version)?;
 
-    // На Unix делаем executable
+    // Скачиваем Node.js бинарник для целевой платформы
+    download_node_binary(node_version, node_arch, &exe_path).await?;
+
+    // Делаем исполняемым (Unix)
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -279,104 +312,224 @@ fn build_for_platform(
         fs::set_permissions(&exe_path, perms)?;
     }
 
-    // Инжектим SEA blob в binary
-    inject_sea_blob(&exe_path, sea_blob, platform)?;
+    // Для macOS удаляем подпись ПЕРЕД инжектом
+    if platform == "macos" || platform == "darwin" {
+        let _ = Command::new("codesign")
+            .arg("--remove-signature")
+            .arg(&exe_path)
+            .output();
+    }
+
+    // Инжектим SEA blob
+    inject_sea_blob(&exe_path, sea_blob, platform).await?;
+
+    // Для macOS переподписываем после инжекта
+    if platform == "macos" || platform == "darwin" {
+        let _ = Command::new("codesign")
+            .arg("--sign")
+            .arg("-")
+            .arg(&exe_path)
+            .output();
+    }
 
     println!("      ✓ {}", output_name);
     Ok(())
 }
 
-/// Копирует Node.js binary
-fn copy_node_binary(dest: &PathBuf, _node_version: &str) -> Result<(), Box<dyn std::error::Error>> {
-    // Получаем путь к текущему Node.js
-    let output = Command::new("which").arg("node").output()?;
-
-    if !output.status.success() {
-        return Err("Cannot find node binary. Is Node.js installed?".into());
-    }
-
-    let node_path = String::from_utf8(output.stdout)?.trim().to_string();
-    fs::copy(&node_path, dest)?;
-
-    Ok(())
-}
-
-/// Инжектит SEA blob в Node.js binary
-fn inject_sea_blob(
-    exe_path: &PathBuf,
-    sea_blob: &PathBuf,
+async fn inject_sea_blob(
+    exe_path: &Path,
+    sea_blob: &Path,
     platform: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Используем postject для всех платформ
-    let mut cmd = Command::new("npx");
+    let mut cmd = TokioCommand::new("npx");
     cmd.arg("postject")
         .arg(exe_path)
         .arg("NODE_SEA_BLOB")
         .arg(sea_blob)
         .arg("--sentinel-fuse")
-        .arg("NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2");
+        .arg(NODE_SEA_FUSE);
 
-    // Для macOS добавляем флаг для работы с Mach-O
-    if platform == "macos" {
+    if platform == "macos" || platform == "darwin" {
         cmd.arg("--macho-segment-name").arg("NODE_SEA");
     }
 
-    let status = cmd.status()?;
+    let output = cmd.output().await?;
 
-    if !status.success() {
-        return Err("Failed to inject SEA blob".into());
-    }
-
-    // Для macOS удаляем подпись
-    if platform == "macos" {
-        Command::new("codesign")
-            .arg("--remove-signature")
-            .arg(exe_path)
-            .output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        return Err(format!(
+            "Failed to inject SEA blob.\nstdout: {}\nstderr: {}",
+            stdout, stderr
+        )
+        .into());
     }
 
     Ok(())
 }
 
-/// Находит путь к bundler скрипту
+async fn download_node_binary(
+    version: &str,
+    arch: &str,
+    dest: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Создаем родительскую директорию если не существует
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    // Получаем latest patch версию
+    let full_version = resolve_node_version(version).await?;
+
+    let is_windows = arch.starts_with("win");
+
+    let archive_name = if is_windows {
+        format!("node-v{}-{}.zip", full_version, arch)
+    } else {
+        format!("node-v{}-{}.tar.gz", full_version, arch)
+    };
+
+    let url = format!("https://nodejs.org/dist/v{}/{}", full_version, archive_name);
+    println!("   Downloading Node.js {} from {}", full_version, url);
+
+    let response = reqwest::get(&url).await?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "Failed to download Node.js from {}: {}",
+            url,
+            response.status()
+        )
+        .into());
+    }
+
+    let body = response.bytes().await?;
+
+    let temp_dir = tempfile::tempdir()?;
+    let archive_path = temp_dir.path().join(&archive_name);
+    fs::write(&archive_path, &body)?;
+
+    // Путь к node бинарнику внутри архива
+    let folder_name = format!("node-v{}-{}", full_version, arch);
+
+    if is_windows {
+        extract_node_from_zip(&archive_path, &folder_name, dest)?;
+    } else {
+        extract_node_from_tar_gz(&archive_path, &folder_name, dest)?;
+    }
+
+    println!("   ✓ Node.js binary saved to: {:?}", dest);
+    Ok(())
+}
+
+fn extract_node_from_zip(
+    archive_path: &Path,
+    folder_name: &str,
+    dest: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let zip_file = fs::File::open(archive_path)?;
+    let mut archive = zip::ZipArchive::new(zip_file)?;
+
+    // В Windows архиве: node-v20.19.6-win-x64/node.exe
+    let node_entry_name = format!("{}/node.exe", folder_name);
+
+    let mut node_file = archive
+        .by_name(&node_entry_name)
+        .map_err(|e| format!("Cannot find {} in archive: {}", node_entry_name, e))?;
+
+    let mut contents = Vec::new();
+    node_file.read_to_end(&mut contents)?;
+    fs::write(dest, contents)?;
+
+    Ok(())
+}
+
+fn extract_node_from_tar_gz(
+    archive_path: &Path,
+    folder_name: &str,
+    dest: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let tar_gz = fs::File::open(archive_path)?;
+    let tar = flate2::read::GzDecoder::new(tar_gz);
+    let mut archive = tar::Archive::new(tar);
+
+    // В Unix архиве: node-v20.19.6-darwin-x64/bin/node
+    let expected_path = format!("{}/bin/node", folder_name);
+
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let path = entry.path()?;
+        let path_str = path.to_string_lossy();
+
+        if path_str == expected_path || path_str.ends_with("/bin/node") {
+            let mut contents = Vec::new();
+            entry.read_to_end(&mut contents)?;
+            fs::write(dest, contents)?;
+            return Ok(());
+        }
+    }
+
+    Err(format!("Cannot find {} in archive", expected_path).into())
+}
+
+async fn resolve_node_version(major: &str) -> Result<String, Box<dyn std::error::Error>> {
+    // Если уже полная версия (например "20.19.6"), вернуть как есть
+    if major.matches('.').count() >= 2 {
+        return Ok(major.to_string());
+    }
+
+    let url = "https://nodejs.org/dist/index.json";
+    let client = reqwest::Client::new();
+    let versions: Vec<NodeVersion> = client.get(url).send().await?.json().await?;
+
+    let major_prefix = format!("{}.", major);
+
+    for v in versions {
+        let version_num = v.version.strip_prefix('v').unwrap_or(&v.version);
+        if version_num.starts_with(&major_prefix) || version_num == major {
+            return Ok(version_num.to_string());
+        }
+    }
+
+    Err(format!("No Node.js version found for major version: {}", major).into())
+}
+
+#[derive(serde::Deserialize)]
+struct NodeVersion {
+    version: String,
+}
+
 fn get_bundler_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
-    // Ищем относительно исполняемого файла
     let exe_dir = std::env::current_exe()?
         .parent()
         .ok_or("Cannot get exe dir")?
         .to_path_buf();
 
-    let bundler = exe_dir.join("../bundler/index.js");
-    if bundler.exists() {
-        return Ok(bundler);
-    }
+    let paths_to_try = [
+        exe_dir.join("../bundler/index.js"),
+        PathBuf::from("bundler/index.js"),
+        exe_dir.join("bundler/index.js"),
+        PathBuf::from("./bundler/index.js"),
+    ];
 
-    // Fallback на текущую директорию
-    let bundler = PathBuf::from("bundler/index.js");
-    if bundler.exists() {
-        return Ok(bundler);
+    for path in &paths_to_try {
+        if path.exists() {
+            return Ok(path.canonicalize().unwrap_or(path.clone()));
+        }
     }
 
     Err("Cannot find bundler/index.js. Make sure it's in the bundler/ directory.".into())
 }
 
-/// Выводит список созданных executables
-fn list_executables(output: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
-    let entries = fs::read_dir(output)?;
-
-    for entry in entries {
+fn list_executables(output: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    for entry in fs::read_dir(output)? {
         let entry = entry?;
         let path = entry.path();
-
-        if let Some(name) = path.file_name() {
-            let name_str = name.to_string_lossy();
-            if name_str.starts_with("app-") {
-                let metadata = fs::metadata(&path)?;
-                let size_kb = metadata.len() / 1024;
-                println!("   📄 {} ({} KB)", name_str, size_kb);
+        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+            if name.starts_with("app-") {
+                let size_mb = fs::metadata(&path)?.len() as f64 / 1024.0 / 1024.0;
+                println!("   📄 {} ({:.1} MB)", name, size_mb);
             }
         }
     }
-
     Ok(())
 }
