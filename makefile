@@ -52,6 +52,9 @@ clean:
 local:
 	cargo run -- ./example --platform host && ./dist/app-macos
 
+bp:
+	cargo run -- --config
+
 # Показать справку
 help:
 	@echo "Available commands:"

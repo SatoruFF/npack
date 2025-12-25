@@ -1,4 +1,6 @@
+mod config;
 use clap::Parser;
+use config::NpackConfig;
 use serde::{Deserialize, Serialize};
 use std::fs::{self};
 use std::io::Read;
@@ -6,34 +8,68 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use tokio::process::Command as TokioCommand;
 
-#[derive(Parser)]
+#[derive(Parser, Debug, Clone)]
 #[command(name = "npack")]
 #[command(version = "0.0.1")]
 #[command(about = "Package Node.js apps into standalone executables", long_about = None)]
-struct Args {
-    /// Path to app folder or Git repository URL
-    input: String,
+pub struct Args {
+    /// Git repository URL or local directory (optional if using config)
+    pub source: Option<String>,
 
-    /// Target platform(s): host, all, linux, macos, windows
-    #[arg(long, default_value = "host")]
-    platform: String,
+    /// Use config file (looks for npack.config.json in current directory)
+    #[arg(long)]
+    pub config: bool,
+
+    /// Path to custom config file
+    #[arg(long, value_name = "FILE")]
+    pub config_file: Option<PathBuf>,
+
+    /// Entry point JavaScript file
+    #[arg(long)]
+    pub entry: Option<String>,
+
+    /// Target platform
+    #[arg(long)]
+    pub platform: Option<String>,
+
+    /// Node.js version
+    #[arg(long)]
+    pub node_version: Option<String>,
 
     /// Output directory
-    #[arg(long, short, default_value = "./dist")]
-    output: PathBuf,
-
-    /// Skip bundling step (use existing bundle)
     #[arg(long)]
-    skip_bundle: bool,
+    pub output: Option<PathBuf>,
 
-    /// Node.js version to use (e.g., 20, 22, 24 — will use latest patch)
-    #[arg(long, default_value = "24")]
-    node_version: String,
+    /// Run postinstall script
+    #[arg(long)]
+    pub run_postinstall: bool,
 
-    /// Custom entry point (e.g., postinstall.js, src/server.js)
-    /// If not specified, will auto-detect from package.json
-    #[arg(long, short)]
-    entry: Option<String>,
+    /// Database connection string
+    #[arg(long)]
+    pub db_connection: Option<String>,
+
+    /// S3 Key
+    #[arg(long)]
+    pub s3_key: Option<String>,
+
+    /// S3 Secret
+    #[arg(long)]
+    pub s3_secret: Option<String>,
+}
+
+impl Args {
+    /// Merge with environment variables
+    pub fn merge_with_env(&mut self) {
+        if self.db_connection.is_none() {
+            self.db_connection = std::env::var("DB_CONNECTION_STRING").ok();
+        }
+        if self.s3_key.is_none() {
+            self.s3_key = std::env::var("PACKAGES_STORAGE_S3_KEY").ok();
+        }
+        if self.s3_secret.is_none() {
+            self.s3_secret = std::env::var("PACKAGES_STORAGE_S3_SECRET").ok();
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -49,41 +85,55 @@ const NODE_SEA_FUSE: &str = "NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args = Args::parse();
+    let mut args = Args::parse();
 
-    // ✅ Удаляем существующую dist директорию ПЕРЕД запуском
-    let output = PathBuf::from("./dist");
-    if output.exists() {
-        println!("🗑 Removing existing output directory {:?}...", output);
-        fs::remove_dir_all(&output)?;
+    // ✅ Сначала читаем из ENV
+    args.merge_with_env();
+
+    // Load config if requested
+    let mut config = if args.config {
+        NpackConfig::find_in_cwd().unwrap_or_default()
+    } else if let Some(config_path) = &args.config_file {
+        NpackConfig::from_file(config_path)?
+    } else {
+        NpackConfig::default()
+    };
+
+    // Merge CLI args (override config)
+    config.merge_with_args(&args);
+
+    // Validate config
+    config.validate()?;
+
+    println!("📦 npack v{}\n", env!("CARGO_PKG_VERSION"));
+
+    // Применяем ENV из конфига
+    let env_vars = config.get_env_vars();
+    for (key, value) in &env_vars {
+        std::env::set_var(key, value);
     }
 
-    if let Err(e) = run(args).await {
+    if let Err(e) = run(config).await {
         eprintln!("❌ Error: {}", e);
-        // let output = PathBuf::from("./dist");
-        // if output.exists() {
-        //     if let Err(err) = fs::remove_dir_all(&output) {
-        //         eprintln!("⚠️ Failed to remove {:?}: {}", output, err);
-        //     } else {
-        //         println!("🗑 Removed {:?}", output);
-        //     }
-        // }
         std::process::exit(1);
     }
     Ok(())
 }
 
-async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
-    println!("📦 npack v0.0.1\n");
+async fn run(config: NpackConfig) -> Result<(), Box<dyn std::error::Error>> {
+    let source = config.get_source()?;
+    let output = PathBuf::from(config.get_output());
+    let platform = config.get_platform();
+    let node_version = config.get_node_version();
 
     // Создаем output директорию СРАЗУ
-    fs::create_dir_all(&args.output)
-        .map_err(|e| format!("Failed to create output directory {:?}: {}", args.output, e))?;
+    fs::create_dir_all(&output)
+        .map_err(|e| format!("Failed to create output directory {:?}: {}", output, e))?;
 
-    let target_platform = if args.platform == "host" {
+    let target_platform = if platform == "host" {
         std::env::consts::OS
     } else {
-        &args.platform
+        platform.as_str()
     };
 
     let (node_arch, _) = match target_platform {
@@ -94,8 +144,8 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Скачиваем node binary
-    let node_binary_path = args.output.join("node-binary");
-    download_node_binary(&args.node_version, node_arch, &node_binary_path).await?;
+    let node_binary_path = output.join("node-binary");
+    download_node_binary(&node_version, node_arch, &node_binary_path).await?;
 
     // Делаем исполняемым (Unix)
     #[cfg(unix)]
@@ -106,53 +156,42 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         fs::set_permissions(&node_binary_path, perms)?;
     }
 
-    let app_path = if args.input.starts_with("http") || args.input.starts_with("git@") {
+    let app_path = if source.starts_with("http") || source.starts_with("git@") {
         println!("🔄 Cloning repository...");
-        clone_repository(&args.input, &args.output)
-            .map_err(|e| format!("Git clone failed: {}", e))?
+        clone_repository(&source, &output).map_err(|e| format!("Git clone failed: {}", e))?
     } else {
-        PathBuf::from(&args.input)
+        PathBuf::from(&source)
     };
 
     println!("   App: {:?}", app_path);
-    println!("   Platform: {}", args.platform);
-    println!("   Node version: {}\n", args.node_version);
+    println!("   Platform: {}", platform);
+    println!("   Node version: {}\n", node_version);
 
-    if !args.skip_bundle {
-        println!("📥 Installing dependencies...");
-        install_dependencies(&app_path)
-            .map_err(|e| format!("Installing dependencies failed: {}", e))?;
-    }
+    println!("📥 Installing dependencies...");
+    install_dependencies(&app_path, &config)
+        .map_err(|e| format!("Installing dependencies failed: {}", e))?;
 
-    let bundle_path = if !args.skip_bundle {
-        println!("\n🔨 Bundling with ESBUILD...");
-        bundle_app(&app_path, &args.output, args.entry.as_deref())
-            .map_err(|e| format!("Bundling failed: {}", e))?
-    } else {
-        println!("⏭️  Skipping bundle step");
-        args.output.join("bundle.js")
-    };
+    println!("\n🔨 Bundling with ESBUILD...");
+    let bundle_path = bundle_app(&app_path, &output, config.get_entry().as_deref())
+        .map_err(|e| format!("Bundling failed: {}", e))?;
 
     println!("\n📦 Creating Node.js SEA...");
-    let sea_blob = create_sea(&bundle_path, &args.output, &node_binary_path)
+    let sea_blob = create_sea(&bundle_path, &output, &node_binary_path)
         .map_err(|e| format!("SEA creation failed: {}", e))?;
 
     println!("\n🎯 Creating platform executables...");
     create_executables(
-        &args.platform,
+        &platform,
         &sea_blob,
-        &args.output,
-        &args.node_version,
+        &output,
+        &node_version,
         &node_binary_path,
     )
     .await
     .map_err(|e| format!("Creating executables failed: {}", e))?;
 
-    // Cleanup временных файлов
-    cleanup_temp_files(&args.output)?;
-
     println!("\n✅ Done! Executables:");
-    list_executables(&args.output).map_err(|e| format!("Listing executables failed: {}", e))?;
+    list_executables(&output).map_err(|e| format!("Listing executables failed: {}", e))?;
 
     Ok(())
 }
@@ -203,25 +242,139 @@ fn clone_repository(url: &str, output: &PathBuf) -> Result<PathBuf, Box<dyn std:
     Ok(clone_dir)
 }
 
-fn install_dependencies(app_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+fn patch_npm_postinstall(app_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let postinstall_path = app_path.join("npmPostinstall.js");
+
+    if !postinstall_path.exists() {
+        return Ok(());
+    }
+
+    let content = fs::read_to_string(&postinstall_path)?;
+
+    // ✅ Заменяем spawn.sync("npm", ["run", "prepack"]) на npx babel
+    let patched = content
+        .replace(
+            r#"const result = spawn.sync("npm", ["run", "prepack"]);"#,
+            r#"const result = spawn.sync("npx", ["babel", "-d", "lib/", "src/", "--source-maps", "inline"]);"#
+        )
+        .replace(
+            r#"spawn.sync("node", ["postinstall"])"#,
+            r#"spawn.sync("node", ["lib/postinstall/index.js"])"#
+        );
+
+    fs::write(&postinstall_path, patched)?;
+    println!("   ✓ Patched npmPostinstall.js");
+
+    Ok(())
+}
+
+fn install_dependencies(app_path: &Path, config: &NpackConfig) -> Result<(), Box<dyn std::error::Error>> {
     if !app_path.join("package.json").exists() {
         println!("   No package.json found, skipping npm install");
         return Ok(());
     }
 
     let npm_cmd = if cfg!(windows) { "npm.cmd" } else { "npm" };
-    let status = Command::new(npm_cmd)
+    
+    // ✅ Читаем package.json чтобы понять что там есть
+    let package_json_path = app_path.join("package.json");
+    let package_content = fs::read_to_string(&package_json_path)?;
+    let package: serde_json::Value = serde_json::from_str(&package_content)?;
+    
+    // Проверяем есть ли babel в devDependencies
+    let has_babel = package
+        .get("devDependencies")
+        .and_then(|deps| deps.as_object())
+        .map(|deps| {
+            deps.contains_key("@babel/core") || 
+            deps.contains_key("@babel/cli") ||
+            deps.contains_key("babel-cli")
+        })
+        .unwrap_or(false);
+
+    // Проверяем есть ли compile script
+    let has_compile_script = package
+        .get("scripts")
+        .and_then(|scripts| scripts.as_object())
+        .and_then(|scripts| scripts.get("compile"))
+        .is_some();
+
+    // ✅ Устанавливаем зависимости (с dev если есть babel)
+    let mut install_cmd = Command::new(npm_cmd);
+    install_cmd
         .arg("install")
-        .arg("--production")
         .arg("--ignore-scripts")
-        .current_dir(app_path)
-        .status()?;
+        .current_dir(app_path);
+
+    if !has_babel {
+        install_cmd.arg("--omit=dev");
+    }
+
+    let status = install_cmd.status()?;
 
     if !status.success() {
         return Err("npm install failed".into());
     }
 
     println!("   ✓ Dependencies installed");
+
+    // ✅ Запускаем babel compile только если есть скрипт
+    if has_compile_script {
+        println!("\n🔨 Compiling with Babel...");
+        let compile = Command::new(npm_cmd)
+            .current_dir(app_path)
+            .args(&["run", "compile"])
+            .status();
+
+        match compile {
+            Ok(status) if status.success() => {
+                println!("   ✓ Babel compilation completed");
+            }
+            Ok(status) => {
+                eprintln!("   ⚠️ Babel compilation failed with code: {:?}", status.code());
+                return Err(format!("Babel compilation failed with code: {:?}", status.code()).into());
+            }
+            Err(e) => {
+                eprintln!("   ⚠️ Compile script error: {}", e);
+                return Err(format!("Compile script error: {}", e).into());
+            }
+        }
+    }
+
+    // ✅ Запускаем postinstall если указано в конфиге
+    if config.should_run_postinstall() {
+        println!("\n🔄 Running postinstall...");
+
+        // ✅ УСТАНАВЛИВАЕМ ENV ПЕРЕМЕННЫЕ из конфига
+        let env_vars = config.get_env_vars();
+        
+        let mut postinstall_cmd = Command::new(npm_cmd);
+        postinstall_cmd
+            .current_dir(app_path)
+            .args(&["run", "postinstall"]);
+
+        // ✅ Добавляем все ENV переменные в процесс
+        for (key, value) in &env_vars {
+            postinstall_cmd.env(key, value);
+            println!("   ENV: {} = {}", key, if key.contains("SECRET") { "***" } else { value });
+        }
+
+        let postinstall = postinstall_cmd.status();
+
+        match postinstall {
+            Ok(status) if status.success() => {
+                println!("   ✓ Postinstall completed");
+            }
+            Ok(status) => {
+                eprintln!("   ⚠️ Postinstall failed with code: {:?}", status.code());
+                // НЕ фейлим весь билд, продолжаем
+            }
+            Err(e) => {
+                eprintln!("   ⚠️ Postinstall error: {}", e);
+            }
+        }
+    }
+
     Ok(())
 }
 
