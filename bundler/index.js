@@ -1,24 +1,31 @@
-import swc from "@swc/core";
+import esbuild from "esbuild";
 import fs from "fs/promises";
 import path from "path";
-import * as babelParser from "@babel/parser";
-import babelGenerate from "@babel/generator";
-import babelTraverse from "@babel/traverse";
+import { fileURLToPath } from "url";
 
 /**
- * Собирает все статические ассеты и динамически найденные файлы
+ * Собирает все статические ассеты
  */
-async function collectAllAssets(appDir, scannedFiles = new Set()) {
+async function collectAllAssets(appDir) {
   const assets = new Map();
 
-  // Стандартные директории со статикой
   const commonDirs = [
-    "config", "templates", "public", "assets", "data", 
-    "migrations", "views", "locale", "locales", "i18n",
-    "static", "resources", "sql", "queries"
+    "config",
+    "templates",
+    "public",
+    "assets",
+    "data",
+    "migrations",
+    "views",
+    "locale",
+    "locales",
+    "i18n",
+    "static",
+    "resources",
+    "sql",
+    "queries",
   ];
 
-  // Сканируем стандартные директории
   for (const dir of commonDirs) {
     const fullPath = path.join(appDir, dir);
     try {
@@ -27,20 +34,29 @@ async function collectAllAssets(appDir, scannedFiles = new Set()) {
         await scanDirectory(fullPath, appDir, assets);
       }
     } catch (e) {
-      // Директория не найдена - пропускаем
+      // Директория не найдена
     }
   }
 
-  // Сканируем файлы с нестандартными расширениями в корне проекта
   const nonCodeExtensions = [
-    ".sql", ".json", ".yaml", ".yml", ".xml", ".txt", 
-    ".md", ".csv", ".env", ".pem", ".key", ".cert"
+    ".sql",
+    ".json",
+    ".yaml",
+    ".yml",
+    ".xml",
+    ".txt",
+    ".md",
+    ".csv",
+    ".env",
+    ".pem",
+    ".key",
+    ".cert",
   ];
-  
+
   try {
     const entries = await fs.readdir(appDir, { withFileTypes: true });
     for (const entry of entries) {
-      if (entry.isFile() && nonCodeExtensions.some(ext => entry.name.endsWith(ext))) {
+      if (entry.isFile() && nonCodeExtensions.some((ext) => entry.name.endsWith(ext))) {
         const fullPath = path.join(appDir, entry.name);
         const content = await fs.readFile(fullPath);
         assets.set("/" + entry.name, {
@@ -61,17 +77,17 @@ async function scanDirectory(dir, baseDir, assets) {
 
   for (const entry of entries) {
     const fullPath = path.join(dir, entry.name);
-    
+
     if (entry.name === "node_modules" || entry.name === ".git") {
       continue;
     }
-    
+
     if (entry.isDirectory()) {
       await scanDirectory(fullPath, baseDir, assets);
     } else {
       const relativePath = path.relative(baseDir, fullPath);
       const content = await fs.readFile(fullPath);
-      
+
       assets.set("/" + relativePath.replace(/\\/g, "/"), {
         content: content.toString("base64"),
         encoding: "base64",
@@ -80,15 +96,30 @@ async function scanDirectory(dir, baseDir, assets) {
   }
 }
 
-/**
- * Находит entry point из package.json
- */
-async function findEntryPoint(appDir) {
+async function findEntryPoint(appDir, customEntry = null) {
+  if (customEntry) {
+    const fullPath = path.join(appDir, customEntry);
+    try {
+      await fs.access(fullPath);
+      return fullPath;
+    } catch (e) {
+      // ✅ Если не найден, попробуй src/ версию (для Babel)
+      const srcPath = path.join(appDir, 'src', customEntry);
+      try {
+        await fs.access(srcPath);
+        console.log(`   Using source version: src/${customEntry}`);
+        return srcPath;
+      } catch {
+        throw new Error(`Entry point not found: ${customEntry}`);
+      }
+    }
+  }
+
   const packageJsonPath = path.join(appDir, "package.json");
-  
+
   try {
     const packageJson = JSON.parse(await fs.readFile(packageJsonPath, "utf8"));
-    
+
     if (packageJson.bin) {
       if (typeof packageJson.bin === "string") {
         return path.join(appDir, packageJson.bin);
@@ -97,18 +128,15 @@ async function findEntryPoint(appDir) {
         return path.join(appDir, firstBin);
       }
     }
-    
+
     if (packageJson.main) {
       return path.join(appDir, packageJson.main);
     }
-    
+
     return path.join(appDir, "index.js");
   } catch (e) {
-    const candidates = [
-      "index.js", "index.mjs", "index.ts", 
-      "src/index.js", "src/index.ts", "src/main.js"
-    ];
-    
+    const candidates = ["index.js", "index.mjs", "index.ts", "src/index.js", "src/index.ts", "src/main.js"];
+
     for (const candidate of candidates) {
       const fullPath = path.join(appDir, candidate);
       try {
@@ -118,14 +146,11 @@ async function findEntryPoint(appDir) {
         continue;
       }
     }
-    
+
     throw new Error("Could not find entry point");
   }
 }
 
-/**
- * Генерирует VFS код с полным перехватом путей (уникальные имена)
- */
 function generateVFSCode(assets) {
   const entries = Array.from(assets.entries()).map(([filePath, data]) => {
     return `  ${JSON.stringify(filePath)}: {
@@ -149,67 +174,50 @@ const __NPACK_STAT_SYNC = __NPACK_ORIG_FS.statSync;
 const __NPACK_READDIR_SYNC = __NPACK_ORIG_FS.readdirSync;
 const __NPACK_READDIR = __NPACK_ORIG_FS.promises.readdir;
 
-// Нормализация путей (с поддержкой абсолютных)
 function __NPACK_normalizePath(filePath) {
   if (!filePath) return filePath;
-  
   let normalized = filePath.toString().replace(/\\\\/g, "/");
-  
   if (normalized.startsWith("file://")) {
     normalized = normalized.slice(7);
   }
-  
-  // ✅ Если путь абсолютный и содержит __dirname, вырезаем префикс
   if (normalized.startsWith(__dirname)) {
     normalized = normalized.slice(__dirname.length);
   }
-  
-  // Убираем двойные слэши
   normalized = normalized.replace(/\\/\\/+/g, "/");
-  
   if (!normalized.startsWith("/")) {
     normalized = "/" + normalized;
   }
-  
   return normalized;
 }
 
 function __NPACK_isInVFS(filePath) {
   const normalized = __NPACK_normalizePath(filePath);
   if (__NPACK_VFS[normalized]) return true;
-  
   for (const vfsPath of Object.keys(__NPACK_VFS)) {
     if (vfsPath === normalized || vfsPath.endsWith(normalized) || normalized.endsWith(vfsPath)) {
       return true;
     }
   }
-  
   return false;
 }
 
 function __NPACK_getFromVFS(filePath) {
   const normalized = __NPACK_normalizePath(filePath);
-  
   if (__NPACK_VFS[normalized]) {
     return __NPACK_VFS[normalized];
   }
-  
   for (const [vfsPath, data] of Object.entries(__NPACK_VFS)) {
     if (vfsPath === normalized || vfsPath.endsWith(normalized) || normalized.endsWith(vfsPath)) {
       return data;
     }
   }
-  
   return null;
 }
 
 function __NPACK_listVFSDir(dirPath) {
   const normalized = __NPACK_normalizePath(dirPath);
   const files = new Set();
-  
-  // ✅ Ищем файлы в VFS с этим префиксом
   for (const vfsPath of Object.keys(__NPACK_VFS)) {
-    // Точное совпадение директории или поддиректория
     if (vfsPath.startsWith(normalized + "/") || (normalized === "/" && vfsPath.startsWith("/"))) {
       const relativePath = vfsPath.slice(normalized.length + 1);
       if (relativePath) {
@@ -218,7 +226,6 @@ function __NPACK_listVFSDir(dirPath) {
       }
     }
   }
-  
   return files.size > 0 ? Array.from(files) : null;
 }
 
@@ -285,13 +292,9 @@ __NPACK_ORIG_FS.promises.readdir = async function(dirPath, options) {
 `;
 }
 
-
-/**
- * Главная функция бандлинга
- */
-export async function bundle(appDir, outputDir) {
+export async function bundle(appDir, outputDir, customEntry = null) {
   console.log("🔍 Finding entry point...");
-  const entryPoint = await findEntryPoint(appDir);
+  const entryPoint = await findEntryPoint(appDir, customEntry);
   console.log(`   Entry: ${path.relative(appDir, entryPoint)}`);
 
   console.log("📂 Collecting static assets...");
@@ -301,162 +304,79 @@ export async function bundle(appDir, outputDir) {
   const outputPath = path.join(outputDir, "bundle.js");
   await fs.mkdir(outputDir, { recursive: true });
 
-  console.log("🔨 Bundling with SWC...");
+  console.log("🔨 Bundling with esbuild...");
 
-  const result = await swc.transformFile(entryPoint, {
-    jsc: {
-      target: "es2022",
-      parser: {
-        syntax: "ecmascript",
-        dynamicImport: true,
-      },
-      transform: {
-        legacyDecorator: false,
-        decoratorMetadata: false,
-      },
+  // ✅ Список optional deps которые часто отсутствуют
+  const optionalDeps = [
+    'sqlite3', 'mysql', 'mysql2', 'pg-query-stream', 'tedious', 'oracledb',
+    'better-sqlite3', 'pg-native', 'cls-bluebird', 'continuation-local-storage'
+  ];
+
+  const result = await esbuild.build({
+    entryPoints: [entryPoint],
+    bundle: true,
+    platform: "node",
+    target: "node20",
+    format: "cjs",
+    outfile: outputPath,
+    banner: {
+      js: `console.log("🛡️ VFS LOADED");\n\n${generateVFSCode(assets).trim()}\n`,
     },
-    module: {
-      type: "commonjs",
+    external: optionalDeps,  // ✅ Не бандлим optional deps
+    minify: false,
+    sourcemap: false,
+    resolveExtensions: [".tsx", ".ts", ".jsx", ".js", ".css", ".json"],
+    loader: {
+      '.js': 'jsx',
+      '.jsx': 'jsx',
+      '.ts': 'ts',
+      '.tsx': 'tsx',
     },
-    sourceMaps: false,
-    inlineSourcesContent: false,
+    logLevel: 'warning',
+    // ✅ Игнорируем ошибки переприсваивания const (legacy code)
+    // legalComments: 'none',
+    keepNames: true,
+    // ✅ Добавляем shims для отсутствующих модулей
+    inject: [],
   });
 
-  // ✅ AST-очистка (полная версия с заменой всех _path/_url)
-  const ast = babelParser.parse(result.code, {
-    sourceType: "module",
-    plugins: [],
-  });
-
-  babelTraverse.default(ast, {
-    // 1. Удаляем объявления переменных
-    VariableDeclaration(path) {
-      const declarations = path.node.declarations;
-      
-      const filtered = declarations.filter(decl => {
-        if (decl.id.type === 'Identifier') {
-          const name = decl.id.name;
-          return name !== '__dirname' && 
-                 name !== '__filename' && 
-                 name !== '__filename1' &&
-                 name !== '_url' && 
-                 name !== '_path';
-        }
-        return true;
-      });
-
-      if (filtered.length === 0) {
-        path.remove();
-      } else if (filtered.length !== declarations.length) {
-        path.node.declarations = filtered;
-      }
-    },
-
-    // 2. Заменяем ВСЕ _path.* и _path.default.*
-    MemberExpression(path) {
-      const { object, property } = path.node;
-      
-      // _path.default.join/dirname/etc → require('path').join/dirname
-      if (object.type === 'MemberExpression' &&
-          object.object.name === '_path' &&
-          object.property.name === 'default') {
-        path.node.object = {
-          type: 'CallExpression',
-          callee: { type: 'Identifier', name: 'require' },
-          arguments: [{ type: 'StringLiteral', value: 'path' }]
-        };
-      }
-      
-      // _path.join/dirname → require('path').join/dirname
-      if (object.name === '_path') {
-        path.node.object = {
-          type: 'CallExpression',
-          callee: { type: 'Identifier', name: 'require' },
-          arguments: [{ type: 'StringLiteral', value: 'path' }]
-        };
-      }
-
-      // _url.default.fileURLToPath → удаляем полностью (см. CallExpression)
-      if (object.type === 'MemberExpression' &&
-          object.object.name === '_url' &&
-          object.property.name === 'default') {
-        // Обработается в CallExpression
-      }
-    },
-
-    // 3. Заменяем вызовы _url.fileURLToPath на __filename
-    CallExpression(path) {
-      const { callee } = path.node;
-      
-      // (0, _url.fileURLToPath)(...) → __filename
-      if (callee.type === 'SequenceExpression') {
-        const lastExpr = callee.expressions[callee.expressions.length - 1];
-        if (lastExpr.type === 'MemberExpression' &&
-            lastExpr.object?.name === '_url' &&
-            lastExpr.property?.name === 'fileURLToPath') {
-          path.replaceWith({
-            type: 'Identifier',
-            name: '__filename'
-          });
-        }
-      }
-      
-      // _url.fileURLToPath(...) → __filename
-      if (callee.type === 'MemberExpression' &&
-          callee.object.name === '_url' &&
-          callee.property.name === 'fileURLToPath') {
-        path.replaceWith({
-          type: 'Identifier',
-          name: '__filename'
-        });
-      }
-
-      // _url.default.fileURLToPath(...) → __filename
-      if (callee.type === 'MemberExpression' &&
-          callee.object?.type === 'MemberExpression' &&
-          callee.object.object?.name === '_url' &&
-          callee.object.property?.name === 'default' &&
-          callee.property?.name === 'fileURLToPath') {
-        path.replaceWith({
-          type: 'Identifier',
-          name: '__filename'
-        });
-      }
-    }
-  });
-
-  const cleanedCode = babelGenerate.default(ast, {
-    retainLines: false,
-    compact: false,
-  }).code;
-
-  const finalCode = `
-console.log("🛡️ VFS LOADED");
-
-${generateVFSCode(assets).trim()}
-
-${cleanedCode}
-  `.trim();
-
-  await fs.writeFile(outputPath, finalCode, "utf8");
   console.log(`✅ Bundle created: ${outputPath}`);
   return outputPath;
 }
 
+// CLI интерфейс - исправленная проверка для Windows
+const __filename = fileURLToPath(import.meta.url);
+const isMainModule = process.argv[1] === __filename || process.argv[1] === __filename.replace(/\\/g, "/");
 
-// CLI интерфейс
-if (import.meta.url === `file://${process.argv[1]}`) {
-  const appDir = process.argv[2];
-  const outputDir = process.argv[3] || "./dist";
+if (isMainModule) {
+  (async () => {
+    const appDir = process.argv[2];
+    const outputDir = process.argv[3] || "./dist";
 
-  if (!appDir) {
-    console.error("Usage: node bundler/index.js <app-dir> [output-dir]");
-    process.exit(1);
-  }
+    let customEntry = null;
+    const entryIndex = process.argv.indexOf("--entry");
+    if (entryIndex !== -1 && process.argv[entryIndex + 1]) {
+      customEntry = process.argv[entryIndex + 1];
+    }
 
-  bundle(appDir, outputDir).catch((err) => {
-    console.error("❌ Error:", err);
-    console.error(err.stack);
-    process.exit(1);
-  });
+    if (!appDir) {
+      console.error("Usage: node bundler/index.js <app-dir> [output-dir] [--entry <file>]");
+      process.exit(1);
+    }
+
+    try {
+      console.log("📋 Starting bundler...");
+      console.log("   appDir:", appDir);
+      console.log("   outputDir:", outputDir);
+      console.log("   customEntry:", customEntry);
+
+      await bundle(appDir, outputDir, customEntry);
+
+      console.log("✅ Bundler completed successfully");
+    } catch (err) {
+      console.error("❌ Bundler Error:", err.message);
+      console.error("Stack:", err.stack);
+      process.exit(1);
+    }
+  })();
 }

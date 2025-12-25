@@ -1,6 +1,6 @@
 use clap::Parser;
 use serde::{Deserialize, Serialize};
-use std::fs;
+use std::fs::{self};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -8,7 +8,7 @@ use tokio::process::Command as TokioCommand;
 
 #[derive(Parser)]
 #[command(name = "npack")]
-#[command(version = "0.1.0")]
+#[command(version = "0.0.1")]
 #[command(about = "Package Node.js apps into standalone executables", long_about = None)]
 struct Args {
     /// Path to app folder or Git repository URL
@@ -29,6 +29,11 @@ struct Args {
     /// Node.js version to use (e.g., 20, 22, 24 — will use latest patch)
     #[arg(long, default_value = "24")]
     node_version: String,
+
+    /// Custom entry point (e.g., postinstall.js, src/server.js)
+    /// If not specified, will auto-detect from package.json
+    #[arg(long, short)]
+    entry: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -46,23 +51,30 @@ const NODE_SEA_FUSE: &str = "NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2";
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
+    // ✅ Удаляем существующую dist директорию ПЕРЕД запуском
+    let output = PathBuf::from("./dist");
+    if output.exists() {
+        println!("🗑 Removing existing output directory {:?}...", output);
+        fs::remove_dir_all(&output)?;
+    }
+
     if let Err(e) = run(args).await {
         eprintln!("❌ Error: {}", e);
-        let output = PathBuf::from("./dist");
-        if output.exists() {
-            if let Err(err) = fs::remove_dir_all(&output) {
-                eprintln!("⚠️ Failed to remove {:?}: {}", output, err);
-            } else {
-                println!("🗑 Removed {:?}", output);
-            }
-        }
+        // let output = PathBuf::from("./dist");
+        // if output.exists() {
+        //     if let Err(err) = fs::remove_dir_all(&output) {
+        //         eprintln!("⚠️ Failed to remove {:?}: {}", output, err);
+        //     } else {
+        //         println!("🗑 Removed {:?}", output);
+        //     }
+        // }
         std::process::exit(1);
     }
     Ok(())
 }
 
 async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
-    println!("📦 npack v0.1.0\n");
+    println!("📦 npack v0.0.1\n");
 
     // Создаем output директорию СРАЗУ
     fs::create_dir_all(&args.output)
@@ -113,8 +125,9 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let bundle_path = if !args.skip_bundle {
-        println!("\n🔨 Bundling with esbuild...");
-        bundle_app(&app_path, &args.output).map_err(|e| format!("Bundling failed: {}", e))?
+        println!("\n🔨 Bundling with ESBUILD...");
+        bundle_app(&app_path, &args.output, args.entry.as_deref())
+            .map_err(|e| format!("Bundling failed: {}", e))?
     } else {
         println!("⏭️  Skipping bundle step");
         args.output.join("bundle.js")
@@ -200,6 +213,7 @@ fn install_dependencies(app_path: &Path) -> Result<(), Box<dyn std::error::Error
     let status = Command::new(npm_cmd)
         .arg("install")
         .arg("--production")
+        .arg("--ignore-scripts")
         .current_dir(app_path)
         .status()?;
 
@@ -211,19 +225,50 @@ fn install_dependencies(app_path: &Path) -> Result<(), Box<dyn std::error::Error
     Ok(())
 }
 
-fn bundle_app(app_path: &Path, output: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
+fn bundle_app(
+    app_path: &Path,
+    output: &Path,
+    entry: Option<&str>,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let bundler_path = get_bundler_path()?;
-    let status = Command::new("node")
-        .arg(&bundler_path)
-        .arg(app_path)
-        .arg(output)
-        .status()?;
 
-    if !status.success() {
-        return Err("Bundling failed".into());
+    let mut cmd = Command::new("node");
+    cmd.arg(&bundler_path).arg(app_path).arg(output);
+
+    if let Some(entry_point) = entry {
+        cmd.arg("--entry").arg(entry_point);
     }
 
-    Ok(output.join("bundle.js"))
+    // ✅ Используем .output() чтобы захватить stdout/stderr
+    let output_result = cmd.output()?;
+
+    // ✅ Выводим stdout (включая ошибки от bundler)
+    let stdout = String::from_utf8_lossy(&output_result.stdout);
+    if !stdout.is_empty() {
+        print!("{}", stdout);
+    }
+
+    // ✅ Выводим stderr
+    let stderr = String::from_utf8_lossy(&output_result.stderr);
+    if !stderr.is_empty() {
+        eprint!("{}", stderr);
+    }
+
+    if !output_result.status.success() {
+        return Err(format!("Bundling failed with exit code: {}", output_result.status).into());
+    }
+
+    let bundle_path = output.join("bundle.js");
+
+    if !bundle_path.exists() {
+        return Err(format!(
+            "Bundler completed but bundle.js not found at {:?}",
+            bundle_path
+        )
+        .into());
+    }
+
+    Ok(bundle_path)
 }
 
 fn create_sea(
@@ -341,7 +386,10 @@ async fn inject_sea_blob(
     sea_blob: &Path,
     platform: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut cmd = TokioCommand::new("npx");
+    // ✅ На Windows используем npx.cmd
+    let npx_cmd = if cfg!(windows) { "npx.cmd" } else { "npx" };
+
+    let mut cmd = TokioCommand::new(npx_cmd);
     cmd.arg("postject")
         .arg(exe_path)
         .arg("NODE_SEA_BLOB")
@@ -352,6 +400,8 @@ async fn inject_sea_blob(
     if platform == "macos" || platform == "darwin" {
         cmd.arg("--macho-segment-name").arg("NODE_SEA");
     }
+
+    println!("   Running: {} postject {:?}", npx_cmd, exe_path);
 
     let output = cmd.output().await?;
 
@@ -499,21 +549,47 @@ struct NodeVersion {
 }
 
 fn get_bundler_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let exe_dir = std::env::current_exe()?
-        .parent()
-        .ok_or("Cannot get exe dir")?
-        .to_path_buf();
+    // Относительно Cargo.toml (корень проекта) - работает в dev mode
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let bundler = PathBuf::from(manifest_dir).join("bundler/index.js");
 
+    if bundler.exists() {
+        return Ok(bundler);
+    }
+
+    // Относительно исполняемого файла (для release)
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(exe_dir) = exe_path.parent() {
+            let bundler = exe_dir.join("../bundler/index.js");
+            if bundler.exists() {
+                // ✅ На Unix используем canonicalize (нормализует симлинки)
+                #[cfg(unix)]
+                if let Ok(canonical) = bundler.canonicalize() {
+                    return Ok(canonical);
+                }
+
+                // ✅ На Windows возвращаем как есть (canonicalize ломает)
+                #[cfg(windows)]
+                return Ok(bundler);
+            }
+        }
+    }
+
+    // Относительно текущей директории
     let paths_to_try = [
-        exe_dir.join("../bundler/index.js"),
         PathBuf::from("bundler/index.js"),
-        exe_dir.join("bundler/index.js"),
         PathBuf::from("./bundler/index.js"),
     ];
 
     for path in &paths_to_try {
         if path.exists() {
-            return Ok(path.canonicalize().unwrap_or(path.clone()));
+            #[cfg(unix)]
+            if let Ok(canonical) = path.canonicalize() {
+                return Ok(canonical);
+            }
+
+            #[cfg(windows)]
+            return Ok(path.to_path_buf());
         }
     }
 
