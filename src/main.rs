@@ -13,52 +13,30 @@ use tokio::process::Command as TokioCommand;
 #[command(version = "0.0.1")]
 #[command(about = "Package Node.js apps into standalone executables", long_about = None)]
 pub struct Args {
-    /// Git repository URL or local directory (optional if using config)
     pub source: Option<String>,
-
-    /// Use config file (looks for npack.config.json in current directory)
     #[arg(long)]
     pub config: bool,
-
-    /// Path to custom config file
     #[arg(long, value_name = "FILE")]
     pub config_file: Option<PathBuf>,
-
-    /// Entry point JavaScript file
     #[arg(long)]
     pub entry: Option<String>,
-
-    /// Target platform
     #[arg(long)]
     pub platform: Option<String>,
-
-    /// Node.js version
     #[arg(long)]
     pub node_version: Option<String>,
-
-    /// Output directory
     #[arg(long)]
     pub output: Option<PathBuf>,
-
-    /// Run postinstall script
     #[arg(long)]
     pub run_postinstall: bool,
-
-    /// Database connection string
     #[arg(long)]
     pub db_connection: Option<String>,
-
-    /// S3 Key
     #[arg(long)]
     pub s3_key: Option<String>,
-
-    /// S3 Secret
     #[arg(long)]
     pub s3_secret: Option<String>,
 }
 
 impl Args {
-    /// Merge with environment variables
     pub fn merge_with_env(&mut self) {
         if self.db_connection.is_none() {
             self.db_connection = std::env::var("DB_CONNECTION_STRING").ok();
@@ -80,17 +58,13 @@ struct SEAConfig {
     disable_experimental_sea_warning: bool,
 }
 
-// Константа для sentinel fuse (из документации Node.js SEA)
 const NODE_SEA_FUSE: &str = "NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = Args::parse();
-
-    // ✅ Сначала читаем из ENV
     args.merge_with_env();
 
-    // Load config if requested
     let mut config = if args.config {
         NpackConfig::find_in_cwd().unwrap_or_default()
     } else if let Some(config_path) = &args.config_file {
@@ -99,15 +73,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         NpackConfig::default()
     };
 
-    // Merge CLI args (override config)
     config.merge_with_args(&args);
-
-    // Validate config
     config.validate()?;
 
     println!("📦 npack v{}\n", env!("CARGO_PKG_VERSION"));
 
-    // Применяем ENV из конфига
     let env_vars = config.get_env_vars();
     for (key, value) in &env_vars {
         std::env::set_var(key, value);
@@ -126,7 +96,6 @@ async fn run(config: NpackConfig) -> Result<(), Box<dyn std::error::Error>> {
     let platform = config.get_platform();
     let node_version = config.get_node_version();
 
-    // Создаем output директорию СРАЗУ
     fs::create_dir_all(&output)
         .map_err(|e| format!("Failed to create output directory {:?}: {}", output, e))?;
 
@@ -143,11 +112,9 @@ async fn run(config: NpackConfig) -> Result<(), Box<dyn std::error::Error>> {
         _ => return Err(format!("Unsupported platform: {}", target_platform).into()),
     };
 
-    // Скачиваем node binary
     let node_binary_path = output.join("node-binary");
     download_node_binary(&node_version, node_arch, &node_binary_path).await?;
 
-    // Делаем исполняемым (Unix)
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -158,7 +125,7 @@ async fn run(config: NpackConfig) -> Result<(), Box<dyn std::error::Error>> {
 
     let app_path = if source.starts_with("http") || source.starts_with("git@") {
         println!("🔄 Cloning repository...");
-        clone_repository(&source, &output).map_err(|e| format!("Git clone failed: {}", e))?
+        clone_repository(&source, &output)?
     } else {
         PathBuf::from(&source)
     };
@@ -168,16 +135,25 @@ async fn run(config: NpackConfig) -> Result<(), Box<dyn std::error::Error>> {
     println!("   Node version: {}\n", node_version);
 
     println!("📥 Installing dependencies...");
-    install_dependencies(&app_path, &config)
-        .map_err(|e| format!("Installing dependencies failed: {}", e))?;
+    install_dependencies(&app_path, &config)?;
 
-    println!("\n🔨 Bundling with ESBUILD...");
-    let bundle_path = bundle_app(&app_path, &output, config.get_entry().as_deref())
-        .map_err(|e| format!("Bundling failed: {}", e))?;
+    // ✅ БАНДЛИМ код
+    println!("\n🔨 Bundling with rspack...");
+    let bundle_path = bundle_app(&app_path, &output, config.get_entry().as_deref())?;
+
+    // ✅ ШИФРУЕМ node_modules
+    // println!("\n🔐 Encrypting node_modules...");
+    // let encryption_key = generate_encryption_key();
+    // let enc_path = output.join("app.enc");
+    // pack_and_encrypt_app(&app_path, &enc_path, &encryption_key)?;
+
+    // ✅ СОЗДАЁМ LOADER
+    // println!("   Creating runtime loader...");
+    // let loader_path = output.join("runtime-loader.js");
+    // create_runtime_loader(&loader_path, &encryption_key)?;
 
     println!("\n📦 Creating Node.js SEA...");
-    let sea_blob = create_sea(&bundle_path, &output, &node_binary_path)
-        .map_err(|e| format!("SEA creation failed: {}", e))?;
+    let sea_blob = create_sea(&bundle_path, &output, &node_binary_path)?;
 
     println!("\n🎯 Creating platform executables...");
     create_executables(
@@ -187,36 +163,184 @@ async fn run(config: NpackConfig) -> Result<(), Box<dyn std::error::Error>> {
         &node_version,
         &node_binary_path,
     )
-    .await
-    .map_err(|e| format!("Creating executables failed: {}", e))?;
+    .await?;
+
+    // ✅ КОПИРУЕМ bundle.js и app.enc рядом с .exe
+    // println!("\n📦 Copying assets...");
+    // copy_assets_to_dist(&output, &bundle_path, &enc_path)?;
 
     println!("\n✅ Done! Executables:");
-    list_executables(&output).map_err(|e| format!("Listing executables failed: {}", e))?;
+    list_executables(&output)?;
 
     Ok(())
 }
 
-fn cleanup_temp_files(output: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let files_to_remove = [
-        "node-binary",
-        "sea-config.json",
-        "sea-prep.blob",
-        "bundle.js",
-    ];
-
-    for file in &files_to_remove {
-        let path = output.join(file);
-        if path.exists() {
-            fs::remove_file(&path)?;
-        }
+// ✅ НОВАЯ ФУНКЦИЯ - копирует bundle.js и app.enc рядом с .exe
+fn copy_assets_to_dist(
+    output: &Path,
+    bundle_path: &Path,
+    enc_path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Копируем bundle.js
+    let bundle_dest = output.join("bundle.js");
+    if bundle_path != &bundle_dest {
+        fs::copy(bundle_path, &bundle_dest)?;
     }
 
-    // Удаляем temp_clone если есть
-    let temp_clone = output.join("temp_clone");
-    if temp_clone.exists() {
-        fs::remove_dir_all(&temp_clone)?;
+    // Копируем app.enc
+    let enc_dest = output.join("app.enc");
+    if enc_path != &enc_dest {
+        fs::copy(enc_path, &enc_dest)?;
     }
 
+    println!("   ✓ Copied bundle.js");
+    println!("   ✓ Copied app.enc");
+
+    Ok(())
+}
+
+fn create_sea(
+    bundle_path: &Path, // ✅ Напрямую bundle.js
+    output: &Path,
+    node_binary: &Path,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let sea_config_path = output.join("sea-config.json");
+    let sea_blob_path = output.join("sea-prep.blob");
+
+    let config = serde_json::json!({
+        "main": bundle_path.to_string_lossy(),  // ✅ bundle.js
+        "output": sea_blob_path.to_string_lossy(),
+        "disableExperimentalSEAWarning": true,
+    });
+
+    fs::write(&sea_config_path, serde_json::to_string_pretty(&config)?)?;
+
+    let output = Command::new(node_binary)
+        .arg("--experimental-sea-config")
+        .arg(&sea_config_path)
+        .output()?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "SEA creation failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+
+    Ok(sea_blob_path)
+}
+
+fn bundle_app(
+    app_path: &Path,
+    output: &Path,
+    entry: Option<&str>,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let bundler_path = get_bundler_path()?;
+
+    let mut cmd = Command::new("node");
+    cmd.arg(&bundler_path).arg(app_path).arg(output);
+
+    if let Some(entry_point) = entry {
+        cmd.arg("--entry").arg(entry_point);
+    }
+
+    let output_result = cmd.output()?;
+
+    let stdout = String::from_utf8_lossy(&output_result.stdout);
+    if !stdout.is_empty() {
+        print!("{}", stdout);
+    }
+
+    let stderr = String::from_utf8_lossy(&output_result.stderr);
+    if !stderr.is_empty() {
+        eprint!("{}", stderr);
+    }
+
+    if !output_result.status.success() {
+        return Err(format!("Bundling failed with exit code: {}", output_result.status).into());
+    }
+
+    let bundle_path = output.join("bundle.js");
+
+    if !bundle_path.exists() {
+        return Err(format!(
+            "Bundler completed but bundle.js not found at {:?}",
+            bundle_path
+        )
+        .into());
+    }
+
+    Ok(bundle_path)
+}
+
+fn generate_encryption_key() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+
+    let pid = std::process::id();
+    let seed = format!("{}{}", timestamp, pid);
+    let hash = format!("{:x}", md5::compute(seed.as_bytes()));
+
+    format!("{}{}", hash, hash)
+}
+
+fn pack_and_encrypt_app(
+    app_path: &Path,
+    output_path: &Path,
+    key: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!("   Encrypting application files...");
+
+    let encrypt_script = get_bundler_path()?
+        .parent()
+        .ok_or("Cannot find bundler directory")?
+        .join("encrypt.js");
+
+    if !encrypt_script.exists() {
+        return Err(format!("Encrypt script not found: {:?}", encrypt_script).into());
+    }
+
+    let output = Command::new("node")
+        .arg(&encrypt_script)
+        .arg(app_path)
+        .arg(output_path)
+        .arg(key)
+        .output()?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        return Err(format!("Encryption failed:\n{}\n{}", stdout, stderr).into());
+    }
+
+    println!("   ✓ Application encrypted");
+    Ok(())
+}
+
+fn create_runtime_loader(
+    output_path: &Path,
+    encryption_key: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let loader_template = get_bundler_path()?
+        .parent()
+        .ok_or("Cannot find bundler directory")?
+        .join("runtime-loader.js");
+
+    if !loader_template.exists() {
+        return Err(format!("Runtime loader template not found: {:?}", loader_template).into());
+    }
+
+    let template = fs::read_to_string(&loader_template)?;
+    let loader_code = template.replace("___NPACK_ENCRYPTION_KEY___", encryption_key);
+
+    fs::write(output_path, loader_code)?;
+
+    println!("   ✓ Runtime loader created");
     Ok(())
 }
 
@@ -242,64 +366,37 @@ fn clone_repository(url: &str, output: &PathBuf) -> Result<PathBuf, Box<dyn std:
     Ok(clone_dir)
 }
 
-fn patch_npm_postinstall(app_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let postinstall_path = app_path.join("npmPostinstall.js");
-
-    if !postinstall_path.exists() {
-        return Ok(());
-    }
-
-    let content = fs::read_to_string(&postinstall_path)?;
-
-    // ✅ Заменяем spawn.sync("npm", ["run", "prepack"]) на npx babel
-    let patched = content
-        .replace(
-            r#"const result = spawn.sync("npm", ["run", "prepack"]);"#,
-            r#"const result = spawn.sync("npx", ["babel", "-d", "lib/", "src/", "--source-maps", "inline"]);"#
-        )
-        .replace(
-            r#"spawn.sync("node", ["postinstall"])"#,
-            r#"spawn.sync("node", ["lib/postinstall/index.js"])"#
-        );
-
-    fs::write(&postinstall_path, patched)?;
-    println!("   ✓ Patched npmPostinstall.js");
-
-    Ok(())
-}
-
-fn install_dependencies(app_path: &Path, config: &NpackConfig) -> Result<(), Box<dyn std::error::Error>> {
+fn install_dependencies(
+    app_path: &Path,
+    config: &NpackConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
     if !app_path.join("package.json").exists() {
         println!("   No package.json found, skipping npm install");
         return Ok(());
     }
 
     let npm_cmd = if cfg!(windows) { "npm.cmd" } else { "npm" };
-    
-    // ✅ Читаем package.json чтобы понять что там есть
+
     let package_json_path = app_path.join("package.json");
     let package_content = fs::read_to_string(&package_json_path)?;
     let package: serde_json::Value = serde_json::from_str(&package_content)?;
-    
-    // Проверяем есть ли babel в devDependencies
+
     let has_babel = package
         .get("devDependencies")
         .and_then(|deps| deps.as_object())
         .map(|deps| {
-            deps.contains_key("@babel/core") || 
-            deps.contains_key("@babel/cli") ||
-            deps.contains_key("babel-cli")
+            deps.contains_key("@babel/core")
+                || deps.contains_key("@babel/cli")
+                || deps.contains_key("babel-cli")
         })
         .unwrap_or(false);
 
-    // Проверяем есть ли compile script
     let has_compile_script = package
         .get("scripts")
         .and_then(|scripts| scripts.as_object())
         .and_then(|scripts| scripts.get("compile"))
         .is_some();
 
-    // ✅ Устанавливаем зависимости (с dev если есть babel)
     let mut install_cmd = Command::new(npm_cmd);
     install_cmd
         .arg("install")
@@ -318,7 +415,6 @@ fn install_dependencies(app_path: &Path, config: &NpackConfig) -> Result<(), Box
 
     println!("   ✓ Dependencies installed");
 
-    // ✅ Запускаем babel compile только если есть скрипт
     if has_compile_script {
         println!("\n🔨 Compiling with Babel...");
         let compile = Command::new(npm_cmd)
@@ -331,32 +427,33 @@ fn install_dependencies(app_path: &Path, config: &NpackConfig) -> Result<(), Box
                 println!("   ✓ Babel compilation completed");
             }
             Ok(status) => {
-                eprintln!("   ⚠️ Babel compilation failed with code: {:?}", status.code());
-                return Err(format!("Babel compilation failed with code: {:?}", status.code()).into());
+                return Err(
+                    format!("Babel compilation failed with code: {:?}", status.code()).into(),
+                );
             }
             Err(e) => {
-                eprintln!("   ⚠️ Compile script error: {}", e);
                 return Err(format!("Compile script error: {}", e).into());
             }
         }
     }
 
-    // ✅ Запускаем postinstall если указано в конфиге
     if config.should_run_postinstall() {
         println!("\n🔄 Running postinstall...");
 
-        // ✅ УСТАНАВЛИВАЕМ ENV ПЕРЕМЕННЫЕ из конфига
         let env_vars = config.get_env_vars();
-        
+
         let mut postinstall_cmd = Command::new(npm_cmd);
         postinstall_cmd
             .current_dir(app_path)
             .args(&["run", "postinstall"]);
 
-        // ✅ Добавляем все ENV переменные в процесс
         for (key, value) in &env_vars {
             postinstall_cmd.env(key, value);
-            println!("   ENV: {} = {}", key, if key.contains("SECRET") { "***" } else { value });
+            println!(
+                "   ENV: {} = {}",
+                key,
+                if key.contains("SECRET") { "***" } else { value }
+            );
         }
 
         let postinstall = postinstall_cmd.status();
@@ -367,7 +464,6 @@ fn install_dependencies(app_path: &Path, config: &NpackConfig) -> Result<(), Box
             }
             Ok(status) => {
                 eprintln!("   ⚠️ Postinstall failed with code: {:?}", status.code());
-                // НЕ фейлим весь билд, продолжаем
             }
             Err(e) => {
                 eprintln!("   ⚠️ Postinstall error: {}", e);
@@ -376,86 +472,6 @@ fn install_dependencies(app_path: &Path, config: &NpackConfig) -> Result<(), Box
     }
 
     Ok(())
-}
-
-fn bundle_app(
-    app_path: &Path,
-    output: &Path,
-    entry: Option<&str>,
-) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let bundler_path = get_bundler_path()?;
-
-    let mut cmd = Command::new("node");
-    cmd.arg(&bundler_path).arg(app_path).arg(output);
-
-    if let Some(entry_point) = entry {
-        cmd.arg("--entry").arg(entry_point);
-    }
-
-    // ✅ Используем .output() чтобы захватить stdout/stderr
-    let output_result = cmd.output()?;
-
-    // ✅ Выводим stdout (включая ошибки от bundler)
-    let stdout = String::from_utf8_lossy(&output_result.stdout);
-    if !stdout.is_empty() {
-        print!("{}", stdout);
-    }
-
-    // ✅ Выводим stderr
-    let stderr = String::from_utf8_lossy(&output_result.stderr);
-    if !stderr.is_empty() {
-        eprint!("{}", stderr);
-    }
-
-    if !output_result.status.success() {
-        return Err(format!("Bundling failed with exit code: {}", output_result.status).into());
-    }
-
-    let bundle_path = output.join("bundle.js");
-
-    if !bundle_path.exists() {
-        return Err(format!(
-            "Bundler completed but bundle.js not found at {:?}",
-            bundle_path
-        )
-        .into());
-    }
-
-    Ok(bundle_path)
-}
-
-fn create_sea(
-    bundle_path: &Path,
-    output: &Path,
-    node_binary: &Path,
-) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let sea_config_path = output.join("sea-config.json");
-    let sea_blob_path = output.join("sea-prep.blob");
-
-    let config = SEAConfig {
-        main: bundle_path.to_string_lossy().into_owned(),
-        output: sea_blob_path.to_string_lossy().into_owned(),
-        disable_experimental_sea_warning: true,
-    };
-
-    fs::write(&sea_config_path, serde_json::to_string_pretty(&config)?)?;
-
-    let output = Command::new(node_binary)
-        .arg("--experimental-sea-config")
-        .arg(&sea_config_path)
-        .output()?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        return Err(format!(
-            "SEA creation failed.\nstdout: {}\nstderr: {}",
-            stdout, stderr
-        )
-        .into());
-    }
-
-    Ok(sea_blob_path)
 }
 
 async fn create_executables(
@@ -498,10 +514,8 @@ async fn build_for_platform(
 
     let exe_path = output.join(output_name);
 
-    // Скачиваем Node.js бинарник для целевой платформы
     download_node_binary(node_version, node_arch, &exe_path).await?;
 
-    // Делаем исполняемым (Unix)
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -510,7 +524,6 @@ async fn build_for_platform(
         fs::set_permissions(&exe_path, perms)?;
     }
 
-    // Для macOS удаляем подпись ПЕРЕД инжектом
     if platform == "macos" || platform == "darwin" {
         let _ = Command::new("codesign")
             .arg("--remove-signature")
@@ -518,10 +531,8 @@ async fn build_for_platform(
             .output();
     }
 
-    // Инжектим SEA blob
     inject_sea_blob(&exe_path, sea_blob, platform).await?;
 
-    // Для macOS переподписываем после инжекта
     if platform == "macos" || platform == "darwin" {
         let _ = Command::new("codesign")
             .arg("--sign")
@@ -539,7 +550,6 @@ async fn inject_sea_blob(
     sea_blob: &Path,
     platform: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // ✅ На Windows используем npx.cmd
     let npx_cmd = if cfg!(windows) { "npx.cmd" } else { "npx" };
 
     let mut cmd = TokioCommand::new(npx_cmd);
@@ -576,12 +586,10 @@ async fn download_node_binary(
     arch: &str,
     dest: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Создаем родительскую директорию если не существует
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent)?;
     }
 
-    // Получаем latest patch версию
     let full_version = resolve_node_version(version).await?;
 
     let is_windows = arch.starts_with("win");
@@ -611,7 +619,6 @@ async fn download_node_binary(
     let archive_path = temp_dir.path().join(&archive_name);
     fs::write(&archive_path, &body)?;
 
-    // Путь к node бинарнику внутри архива
     let folder_name = format!("node-v{}-{}", full_version, arch);
 
     if is_windows {
@@ -632,7 +639,6 @@ fn extract_node_from_zip(
     let zip_file = fs::File::open(archive_path)?;
     let mut archive = zip::ZipArchive::new(zip_file)?;
 
-    // В Windows архиве: node-v20.19.6-win-x64/node.exe
     let node_entry_name = format!("{}/node.exe", folder_name);
 
     let mut node_file = archive
@@ -655,7 +661,6 @@ fn extract_node_from_tar_gz(
     let tar = flate2::read::GzDecoder::new(tar_gz);
     let mut archive = tar::Archive::new(tar);
 
-    // В Unix архиве: node-v20.19.6-darwin-x64/bin/node
     let expected_path = format!("{}/bin/node", folder_name);
 
     for entry in archive.entries()? {
@@ -675,7 +680,6 @@ fn extract_node_from_tar_gz(
 }
 
 async fn resolve_node_version(major: &str) -> Result<String, Box<dyn std::error::Error>> {
-    // Если уже полная версия (например "20.19.6"), вернуть как есть
     if major.matches('.').count() >= 2 {
         return Ok(major.to_string());
     }
@@ -702,7 +706,6 @@ struct NodeVersion {
 }
 
 fn get_bundler_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
-    // Относительно Cargo.toml (корень проекта) - работает в dev mode
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let bundler = PathBuf::from(manifest_dir).join("bundler/index.js");
 
@@ -710,25 +713,21 @@ fn get_bundler_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
         return Ok(bundler);
     }
 
-    // Относительно исполняемого файла (для release)
     if let Ok(exe_path) = std::env::current_exe() {
         if let Some(exe_dir) = exe_path.parent() {
             let bundler = exe_dir.join("../bundler/index.js");
             if bundler.exists() {
-                // ✅ На Unix используем canonicalize (нормализует симлинки)
                 #[cfg(unix)]
                 if let Ok(canonical) = bundler.canonicalize() {
                     return Ok(canonical);
                 }
 
-                // ✅ На Windows возвращаем как есть (canonicalize ломает)
                 #[cfg(windows)]
                 return Ok(bundler);
             }
         }
     }
 
-    // Относительно текущей директории
     let paths_to_try = [
         PathBuf::from("bundler/index.js"),
         PathBuf::from("./bundler/index.js"),

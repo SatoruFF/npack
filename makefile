@@ -53,7 +53,7 @@ local:
 	cargo run -- ./example --platform host && ./dist/app-macos
 
 bp:
-	cargo run -- --config
+	rm -rf dist && cargo run -- --config
 
 # Показать справку
 help:
